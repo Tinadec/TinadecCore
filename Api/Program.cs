@@ -42,6 +42,7 @@ builder.Services.AddTinadecPersistence(builder.Configuration, builder.Environmen
 // Register all TinadecCore modules.
 builder.Services.AddTinadecCore();
 builder.Services.AddScoped<ControlPlaneService>();
+builder.Services.AddScoped<TinadecCore.Api.Storage.ProjectSessionLifecycleService>();
 
 builder.Services.AddProblemDetails(options =>
 {

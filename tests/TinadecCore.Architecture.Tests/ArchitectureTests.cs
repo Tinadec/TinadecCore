@@ -53,9 +53,12 @@ public sealed class ArchitectureTests
     [Fact]
     public void OnlyApiProjectUsesWebSdk()
     {
-        // The API project should reference ASP.NET Core.
+        // The API project should reference ASP.NET Core. TinadecCore.Api.Storage
+        // hosts cross-module composition services (Memory + Lifecycle) that do not
+        // touch ASP.NET Core types by design.
         var apiResult = Types.InAssembly(ApiAssembly)
             .That().ResideInNamespace("TinadecCore.Api")
+            .And().DoNotResideInNamespace("TinadecCore.Api.Storage")
             .Should().HaveDependencyOn("Microsoft.AspNetCore")
             .GetResult();
 

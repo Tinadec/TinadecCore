@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using TinadecCore.AgentConfiguration;
+using TinadecCore.Api.Storage;
 using TinadecCore.Contracts.Dtos;
 using TinadecCore.Contracts.Events;
 using TinadecCore.Lifecycle;
@@ -12,8 +13,13 @@ public static class StorageEndpoints
 {
     public static WebApplication MapStorageEndpoints(this WebApplication app)
     {
-        app.MapGet("/api/v1/projects", async (ProjectSessionStore store, CancellationToken ct) =>
-            Results.Ok((await store.ListProjectsAsync(ct).ConfigureAwait(false)).Select(ToProject)));
+        app.MapGet("/api/v1/projects", async (string? lifecycle_status, string? lifecycleStatus, ProjectSessionStore store, CancellationToken ct) =>
+        {
+            var selected = lifecycle_status ?? lifecycleStatus ?? LifecycleStatuses.Active;
+            if (!LifecycleStatuses.IsKnown(selected))
+                return Results.BadRequest(new { code = "INVALID_LIFECYCLE_STATUS", message = "lifecycle_status must be active, archived, or trashed." });
+            return Results.Ok((await store.ListProjectsAsync(selected, ct).ConfigureAwait(false)).Select(ToProject));
+        });
 
         app.MapPost("/api/v1/projects", async (CreateProjectRequest request, ProjectSessionStore store, CancellationToken ct) =>
         {
@@ -26,11 +32,44 @@ public static class StorageEndpoints
             catch (InvalidOperationException ex) { return Results.Conflict(new { code = "DUPLICATE_PROJECT_ROOT", message = ex.Message }); }
         });
 
-        app.MapGet("/api/v1/sessions", async (string? projectId, string? project_id, ProjectSessionStore store, IDbContextFactory<AgentConfigurationDbContext> cfgFactory, CancellationToken ct) =>
+        app.MapPatch("/api/v1/projects/{projectId}", async (string projectId, UpdateProjectRequest request, ProjectSessionStore store, CancellationToken ct) =>
+        {
+            if (!Guid.TryParse(projectId, out var id)) return Results.BadRequest(new { code = "INVALID_PROJECT_ID" });
+            if (string.IsNullOrWhiteSpace(request.Name)) return Results.BadRequest(new { code = "INVALID_PROJECT", message = "Project name is required." });
+            try
+            {
+                var project = await store.RenameProjectAsync(id, request.Name!, ct).ConfigureAwait(false);
+                if (project is null) return Results.NotFound(new { code = "PROJECT_NOT_FOUND" });
+                return Results.Ok(ToProject(project));
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { code = "INVALID_PROJECT", message = ex.Message }); }
+        });
+
+        MapProjectLifecycleEndpoints(app, "archive", lifecycle => lifecycle.ArchiveProjectAsync);
+        MapProjectLifecycleEndpoints(app, "trash", lifecycle => lifecycle.TrashProjectAsync);
+        MapProjectLifecycleEndpoints(app, "restore", lifecycle => lifecycle.RestoreProjectAsync);
+
+        app.MapDelete("/api/v1/projects/{projectId}", async (string projectId, ProjectSessionLifecycleService lifecycle, CancellationToken ct) =>
+        {
+            if (!Guid.TryParse(projectId, out var id)) return Results.BadRequest(new { code = "INVALID_PROJECT_ID" });
+            try
+            {
+                await lifecycle.PurgeProjectAsync(id, ct).ConfigureAwait(false);
+                return Results.NoContent();
+            }
+            catch (KeyNotFoundException) { return Results.NotFound(new { code = "PROJECT_NOT_FOUND" }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { code = "invalid_lifecycle_transition", message = ex.Message }); }
+            catch (ActiveRunConflictException ex) { return Results.Conflict(new { code = "active_run_conflict", message = ex.Message, run_id = ex.RunId }); }
+        });
+
+        app.MapGet("/api/v1/sessions", async (string? projectId, string? project_id, string? lifecycle_status, string? lifecycleStatus, ProjectSessionStore store, IDbContextFactory<AgentConfigurationDbContext> cfgFactory, CancellationToken ct) =>
         {
             var selected = projectId ?? project_id;
             if (selected is not null && !Guid.TryParse(selected, out var parsed)) return Results.BadRequest(new { code = "INVALID_PROJECT_ID" });
-            var sessions = await store.ListSessionsAsync(selected is null ? null : Guid.Parse(selected), ct).ConfigureAwait(false);
+            var status = lifecycle_status ?? lifecycleStatus ?? LifecycleStatuses.Active;
+            if (!LifecycleStatuses.IsKnown(status))
+                return Results.BadRequest(new { code = "INVALID_LIFECYCLE_STATUS", message = "lifecycle_status must be active, archived, or trashed." });
+            var sessions = await store.ListSessionsAsync(selected is null ? null : Guid.Parse(selected), status, ct).ConfigureAwait(false);
             var enriched = new List<object>(sessions.Count);
             foreach (var s in sessions) enriched.Add(await ToSessionEnrichedAsync(s, cfgFactory, ct).ConfigureAwait(false));
             return Results.Ok(enriched);
@@ -82,13 +121,30 @@ public static class StorageEndpoints
                 else if (session is null)
                 {
                     // no mode fields, just title was empty? fallback to fetch
-                    var all = await store.ListSessionsAsync(null, ct).ConfigureAwait(false);
+                    var all = await store.ListSessionsAsync(null, LifecycleStatuses.Active, ct).ConfigureAwait(false);
                     session = all.FirstOrDefault(x => x.Id == id);
                     if (session is null) return Results.NotFound(new { code = "SESSION_NOT_FOUND" });
                 }
                 return Results.Ok(await ToSessionEnrichedAsync(session, cfgFactory, ct).ConfigureAwait(false));
             }
             catch (ArgumentException ex) { return Results.BadRequest(new { code = "INVALID_SESSION", message = ex.Message }); }
+        });
+
+        MapSessionLifecycleEndpoints(app, "archive", lifecycle => lifecycle.ArchiveSessionAsync);
+        MapSessionLifecycleEndpoints(app, "trash", lifecycle => lifecycle.TrashSessionAsync);
+        MapSessionLifecycleEndpoints(app, "restore", lifecycle => lifecycle.RestoreSessionAsync);
+
+        app.MapDelete("/api/v1/sessions/{sessionId}", async (string sessionId, ProjectSessionLifecycleService lifecycle, CancellationToken ct) =>
+        {
+            if (!Guid.TryParse(sessionId, out var id)) return Results.BadRequest(new { code = "INVALID_SESSION_ID" });
+            try
+            {
+                await lifecycle.PurgeSessionAsync(id, ct).ConfigureAwait(false);
+                return Results.NoContent();
+            }
+            catch (KeyNotFoundException) { return Results.NotFound(new { code = "SESSION_NOT_FOUND" }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { code = "invalid_lifecycle_transition", message = ex.Message }); }
+            catch (ActiveRunConflictException ex) { return Results.Conflict(new { code = "active_run_conflict", message = ex.Message, run_id = ex.RunId }); }
         });
 
         app.MapGet("/api/v1/sessions/{sessionId}/messages", async (string sessionId, ProjectSessionStore store, CancellationToken ct) =>
@@ -185,8 +241,46 @@ public static class StorageEndpoints
         return app;
     }
 
-    private static object ToProject(ProjectRecord project) => new { id = project.Id, name = project.Name, path = project.RootPath, kind = project.Kind, created_at = project.CreatedAt, updated_at = project.UpdatedAt, archived = project.Archived };
-    private static object ToSession(SessionRecord session) => new { id = session.Id, project_id = session.ProjectId, title = session.Title, status = session.Status, mode = session.Mode, mode_version_id = session.ModeVersionId, meeting_model = session.MeetingModel, meeting_provider_id = session.MeetingProviderId, summary = session.Summary, history_revision = session.HistoryRevision, created_at = session.CreatedAt, updated_at = session.UpdatedAt, archived = session.Archived };
+    private static void MapProjectLifecycleEndpoints(
+        WebApplication app,
+        string action,
+        Func<ProjectSessionLifecycleService, Func<Guid, CancellationToken, Task<ProjectRecord>>> selector)
+    {
+        app.MapPost($"/api/v1/projects/{{projectId}}/{action}", async (string projectId, ProjectSessionLifecycleService lifecycle, CancellationToken ct) =>
+        {
+            if (!Guid.TryParse(projectId, out var id)) return Results.BadRequest(new { code = "INVALID_PROJECT_ID" });
+            try
+            {
+                await selector(lifecycle)(id, ct).ConfigureAwait(false);
+                return Results.NoContent();
+            }
+            catch (KeyNotFoundException) { return Results.NotFound(new { code = "PROJECT_NOT_FOUND" }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { code = "invalid_lifecycle_transition", message = ex.Message }); }
+            catch (ActiveRunConflictException ex) { return Results.Conflict(new { code = "active_run_conflict", message = ex.Message, run_id = ex.RunId }); }
+        });
+    }
+
+    private static void MapSessionLifecycleEndpoints(
+        WebApplication app,
+        string action,
+        Func<ProjectSessionLifecycleService, Func<Guid, CancellationToken, Task<SessionRecord>>> selector)
+    {
+        app.MapPost($"/api/v1/sessions/{{sessionId}}/{action}", async (string sessionId, ProjectSessionLifecycleService lifecycle, CancellationToken ct) =>
+        {
+            if (!Guid.TryParse(sessionId, out var id)) return Results.BadRequest(new { code = "INVALID_SESSION_ID" });
+            try
+            {
+                await selector(lifecycle)(id, ct).ConfigureAwait(false);
+                return Results.NoContent();
+            }
+            catch (KeyNotFoundException) { return Results.NotFound(new { code = "SESSION_NOT_FOUND" }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { code = "invalid_lifecycle_transition", message = ex.Message }); }
+            catch (ActiveRunConflictException ex) { return Results.Conflict(new { code = "active_run_conflict", message = ex.Message, run_id = ex.RunId }); }
+        });
+    }
+
+    private static object ToProject(ProjectRecord project) => new { id = project.Id, name = project.Name, path = project.RootPath, kind = project.Kind, created_at = project.CreatedAt, updated_at = project.UpdatedAt, lifecycle_status = project.LifecycleStatus, trashed_at = project.TrashedAt };
+    private static object ToSession(SessionRecord session) => new { id = session.Id, project_id = session.ProjectId, title = session.Title, status = session.Status, mode = session.Mode, mode_version_id = session.ModeVersionId, meeting_model = session.MeetingModel, meeting_provider_id = session.MeetingProviderId, summary = session.Summary, history_revision = session.HistoryRevision, created_at = session.CreatedAt, updated_at = session.UpdatedAt, lifecycle_status = session.LifecycleStatus, trashed_at = session.TrashedAt };
 
     private static async Task<object> ToSessionEnrichedAsync(SessionRecord session, IDbContextFactory<AgentConfigurationDbContext> cfgFactory, CancellationToken ct)
     {
@@ -206,7 +300,7 @@ public static class StorageEndpoints
             }
         }
         catch { }
-        return new { id = session.Id, project_id = session.ProjectId, title = session.Title, status = session.Status, mode = session.Mode, mode_version_id = session.ModeVersionId, meeting_model = session.MeetingModel, meeting_provider_id = session.MeetingProviderId, has_update = hasUpdate, latest_mode_version_id = latestModeVersionId, summary = session.Summary, history_revision = session.HistoryRevision, created_at = session.CreatedAt, updated_at = session.UpdatedAt, archived = session.Archived };
+        return new { id = session.Id, project_id = session.ProjectId, title = session.Title, status = session.Status, mode = session.Mode, mode_version_id = session.ModeVersionId, meeting_model = session.MeetingModel, meeting_provider_id = session.MeetingProviderId, has_update = hasUpdate, latest_mode_version_id = latestModeVersionId, summary = session.Summary, history_revision = session.HistoryRevision, created_at = session.CreatedAt, updated_at = session.UpdatedAt, lifecycle_status = session.LifecycleStatus, trashed_at = session.TrashedAt };
     }
     private static object ToMessage(StoredMessage message) => new { id = message.Id, session_id = message.SessionId, run_id = message.RunId, role = message.Role, content = message.Content, created_at = message.CreatedAt };
     private static object ToRun(RunRecord run) => new { id = run.Id, session_id = run.SessionId, trigger_message_id = run.TriggerMessageId, status = run.Status, summary = run.Summary, task_revision = run.TaskRevision, latest_event_sequence = run.LastEventSequence, latest_event_at = run.LastEventAt, created_at = run.CreatedAt, updated_at = run.UpdatedAt, completed_at = run.CompletedAt };
