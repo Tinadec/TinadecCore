@@ -29,6 +29,13 @@ public sealed class AgentConfigurationDbContext : DbContext
     public DbSet<PromptVersionRecord> PromptVersions => Set<PromptVersionRecord>();
     public DbSet<PromptNodeRecord> PromptNodes => Set<PromptNodeRecord>();
     public DbSet<WorkspaceDefaultsRecord> WorkspaceDefaults => Set<WorkspaceDefaultsRecord>();
+    public DbSet<AgentPackInstallationRecord> AgentPackInstallations => Set<AgentPackInstallationRecord>();
+    public DbSet<AgentPackVersionRecord> AgentPackVersions => Set<AgentPackVersionRecord>();
+    public DbSet<AgentPackManagedResourceRecord> AgentPackManagedResources => Set<AgentPackManagedResourceRecord>();
+    public DbSet<AgentPackResourceBindingRecord> AgentPackResourceBindings => Set<AgentPackResourceBindingRecord>();
+    public DbSet<AgentPackPreviewRecord> AgentPackPreviews => Set<AgentPackPreviewRecord>();
+    public DbSet<AgentPackDefaultAdoptionRecord> AgentPackDefaultAdoptions => Set<AgentPackDefaultAdoptionRecord>();
+    public DbSet<AgentPackOperationRecord> AgentPackOperations => Set<AgentPackOperationRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -45,12 +52,15 @@ public sealed class AgentConfigurationDbContext : DbContext
             entity.Property(x => x.ToolScopeJson).HasMaxLength(4096);
             entity.Property(x => x.SystemPrompt).HasMaxLength(16384);
             entity.Property(x => x.Description).HasMaxLength(2048);
+            entity.Property(x => x.SourceKind).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.SourceKey).HasMaxLength(512).IsRequired();
             entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
             entity.Property(x => x.Revision).IsConcurrencyToken();
             // single draft per workspace logical agent
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Slug }).IsUnique().HasFilter("status = 'draft'");
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Status, x.UpdatedAt });
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Layer, x.Status });
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.SourceKind, x.SourceKey }).IsUnique();
         });
 
         modelBuilder.Entity<AgentVersionRecord>(entity =>
@@ -102,6 +112,7 @@ public sealed class AgentConfigurationDbContext : DbContext
             entity.Property(x => x.Label).HasMaxLength(256);
             entity.Property(x => x.PositionJson).HasMaxLength(4096);
             entity.Property(x => x.ConfigJson).HasMaxLength(8192);
+            entity.Property(x => x.ModelStrategyOverrideJson).HasMaxLength(4096);
             entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
             entity.Property(x => x.Revision).IsConcurrencyToken();
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.ModeId, x.NodeKey }).IsUnique().HasFilter("status = 'draft'");
@@ -181,6 +192,85 @@ public sealed class AgentConfigurationDbContext : DbContext
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Status });
         });
 
+        modelBuilder.Entity<AgentPackInstallationRecord>(entity =>
+        {
+            entity.ToTable("agent_pack_installations");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.PackId).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.Owner).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.ProductId).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.Name).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.Revision).IsConcurrencyToken();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.PackId }).IsUnique();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Status, x.UpdatedAt });
+        });
+
+        modelBuilder.Entity<AgentPackVersionRecord>(entity =>
+        {
+            entity.ToTable("agent_pack_versions");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.PackVersion).HasMaxLength(64).IsRequired();
+            entity.Property(x => x.ManifestContentReference).HasMaxLength(2048).IsRequired();
+            entity.Property(x => x.ManifestHash).HasMaxLength(64).IsRequired();
+            entity.HasIndex(x => new { x.InstallationId, x.PackVersion }).IsUnique();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.InstallationId, x.CreatedAt });
+        });
+
+        modelBuilder.Entity<AgentPackManagedResourceRecord>(entity =>
+        {
+            entity.ToTable("agent_pack_managed_resources");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.ResourceKind).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.ResourceKey).HasMaxLength(256).IsRequired();
+            entity.HasIndex(x => new { x.InstallationId, x.ResourceKind, x.ResourceKey }).IsUnique();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.ResourceKind, x.LogicalEntityId }).IsUnique();
+        });
+
+        modelBuilder.Entity<AgentPackResourceBindingRecord>(entity =>
+        {
+            entity.ToTable("agent_pack_resource_bindings");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.ResourceKind).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.ResourceKey).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.ContentHash).HasMaxLength(128).IsRequired();
+            entity.Property(x => x.Disposition).HasMaxLength(32).IsRequired();
+            entity.HasIndex(x => new { x.PackVersionId, x.ResourceKind, x.ResourceKey }).IsUnique();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.VersionId });
+        });
+
+        modelBuilder.Entity<AgentPackPreviewRecord>(entity =>
+        {
+            entity.ToTable("agent_pack_previews");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Action).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.PackId).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.Owner).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.PackVersion).HasMaxLength(64).IsRequired();
+            entity.Property(x => x.ManifestContentReference).HasMaxLength(2048).IsRequired();
+            entity.Property(x => x.ManifestHash).HasMaxLength(64).IsRequired();
+            entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.PrincipalId, x.ExpiresAt });
+        });
+
+        modelBuilder.Entity<AgentPackDefaultAdoptionRecord>(entity =>
+        {
+            entity.ToTable("agent_pack_default_adoptions");
+            entity.HasKey(x => x.Id);
+            entity.HasIndex(x => new { x.InstallationId, x.PackVersionId }).IsUnique();
+        });
+
+        modelBuilder.Entity<AgentPackOperationRecord>(entity =>
+        {
+            entity.ToTable("agent_pack_operations");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.IdempotencyKey).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.Operation).HasMaxLength(64).IsRequired();
+            entity.Property(x => x.RequestHash).HasMaxLength(64).IsRequired();
+            entity.Property(x => x.ResponseJson).HasMaxLength(32768).IsRequired();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.PrincipalId, x.Operation, x.IdempotencyKey }).IsUnique();
+        });
+
         modelBuilder.UseTinadecSnakeCase();
     }
 }
@@ -202,12 +292,15 @@ public sealed class AgentDefinitionRecord
     public string Role { get; set; } = string.Empty;
     public string? CapabilitiesJson { get; set; }
     public Guid? BasePromptPipelineId { get; set; }
-    // json: { kind: inherit|fixed|parent_select|cli|acp, provider_instance_id, model, runtime_id }
+    // json: { kind: inherit } | { kind: route, route_purpose } | { kind: fixed, provider_instance_id, model }
     public string? ModelStrategyJson { get; set; }
     // json: { allowed_tools: string[], deny, etc }
     public string? ToolScopeJson { get; set; }
     public string? SystemPrompt { get; set; }
     public string? Description { get; set; }
+    public string SourceKind { get; set; } = "custom";
+    public string SourceKey { get; set; } = string.Empty;
+    public bool Managed { get; set; }
     public bool Enabled { get; set; } = true;
     public string Status { get; set; } = "draft";
     public long Revision { get; set; }
@@ -285,6 +378,7 @@ public sealed class ModeNodeRecord
     public string? Label { get; set; }
     public string? PositionJson { get; set; }
     public string? ConfigJson { get; set; }
+    public string? ModelStrategyOverrideJson { get; set; }
     public string Status { get; set; } = "draft";
     public long Revision { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
@@ -382,9 +476,130 @@ public sealed class WorkspaceDefaultsRecord
     public Guid? DefaultAgentDefinitionId { get; set; }
     public Guid? DefaultAgentModeId { get; set; }
     public Guid? DefaultPromptPipelineId { get; set; }
+    public Guid? DefaultAgentVersionId { get; set; }
+    public Guid? DefaultModeVersionId { get; set; }
+    public Guid? DefaultPromptVersionId { get; set; }
     public string Status { get; set; } = "active";
     public long Revision { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
     public DateTimeOffset? ArchivedAt { get; set; }
+}
+
+public sealed class AgentPackInstallationRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public string PackId { get; set; } = string.Empty;
+    public string Owner { get; set; } = string.Empty;
+    public string ProductId { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public Guid? ActiveVersionId { get; set; }
+    public string Status { get; set; } = "active";
+    public long Revision { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+    public Guid CreatedByPrincipalId { get; set; }
+    public Guid UpdatedByPrincipalId { get; set; }
+}
+
+public sealed class AgentPackVersionRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid InstallationId { get; set; }
+    public string PackVersion { get; set; } = string.Empty;
+    public string ManifestContentReference { get; set; } = string.Empty;
+    public string ManifestHash { get; set; } = string.Empty;
+    public long ManifestLength { get; set; }
+    public Guid? PreviousVersionId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public Guid CreatedByPrincipalId { get; set; }
+}
+
+public sealed class AgentPackManagedResourceRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid InstallationId { get; set; }
+    public string ResourceKind { get; set; } = string.Empty;
+    public string ResourceKey { get; set; } = string.Empty;
+    public Guid LogicalEntityId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+public sealed class AgentPackResourceBindingRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid PackVersionId { get; set; }
+    public string ResourceKind { get; set; } = string.Empty;
+    public string ResourceKey { get; set; } = string.Empty;
+    public Guid LogicalEntityId { get; set; }
+    public Guid VersionId { get; set; }
+    public string ContentHash { get; set; } = string.Empty;
+    public string Disposition { get; set; } = "created";
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+public sealed class AgentPackPreviewRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid PrincipalId { get; set; }
+    public string Action { get; set; } = string.Empty;
+    public string PackId { get; set; } = string.Empty;
+    public string Owner { get; set; } = string.Empty;
+    public string PackVersion { get; set; } = string.Empty;
+    public string ManifestContentReference { get; set; } = string.Empty;
+    public string ManifestHash { get; set; } = string.Empty;
+    public long ManifestLength { get; set; }
+    public long BaseInstallationRevision { get; set; }
+    public long? BaseDefaultsRevision { get; set; }
+    public Guid? TargetPackVersionId { get; set; }
+    public string Status { get; set; } = "pending";
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset ExpiresAt { get; set; }
+    public DateTimeOffset? ConsumedAt { get; set; }
+}
+
+public sealed class AgentPackDefaultAdoptionRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid InstallationId { get; set; }
+    public Guid PackVersionId { get; set; }
+    public Guid? PreviousAgentDefinitionId { get; set; }
+    public Guid? PreviousAgentVersionId { get; set; }
+    public Guid? PreviousAgentModeId { get; set; }
+    public Guid? PreviousModeVersionId { get; set; }
+    public Guid? PreviousPromptPipelineId { get; set; }
+    public Guid? PreviousPromptVersionId { get; set; }
+    public Guid? AppliedAgentDefinitionId { get; set; }
+    public Guid? AppliedAgentVersionId { get; set; }
+    public Guid? AppliedAgentModeId { get; set; }
+    public Guid? AppliedModeVersionId { get; set; }
+    public Guid? AppliedPromptPipelineId { get; set; }
+    public Guid? AppliedPromptVersionId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+public sealed class AgentPackOperationRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid PrincipalId { get; set; }
+    public string IdempotencyKey { get; set; } = string.Empty;
+    public string Operation { get; set; } = string.Empty;
+    public string RequestHash { get; set; } = string.Empty;
+    public int StatusCode { get; set; }
+    public string ResponseJson { get; set; } = string.Empty;
+    public DateTimeOffset CreatedAt { get; set; }
 }

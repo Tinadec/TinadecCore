@@ -16,6 +16,7 @@ public interface IAgentInstanceService
     Task<RuntimeAgentInstance> CreateRootAsync(RuntimeAgentSeed seed, CancellationToken cancellationToken = default);
     Task<RuntimeAgentInstance> SpawnAsync(AgentSpawnRequest request, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<RuntimeAgentInstance>> ListByRunAsync(Guid runId, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<RuntimeAgentInstance>> ListAllAsync(CancellationToken cancellationToken = default);
     Task ReleaseRunInstancesAsync(Guid runId, CancellationToken cancellationToken = default);
     Task<AgentCandidateRecord> CreateCandidateAsync(AgentCandidateProposal proposal, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<AgentCandidateRecord>> ListCandidatesAsync(string? status = null, CancellationToken cancellationToken = default);
@@ -60,7 +61,23 @@ public sealed record AgentSpawnRequest(
     Guid? TaskId = null,
     string Role = "worker",
     AgentSpawnLimits? Limits = null,
-    AgentCreationIntent Intent = AgentCreationIntent.Temporary);
+    AgentCreationIntent Intent = AgentCreationIntent.Temporary,
+    FrozenAgentTemplate? Template = null);
+
+/// <summary>
+/// A published execution-agent version already captured in the run configuration.
+/// Spawning from this template preserves planner lineage while binding the worker
+/// instance to the specialist's own immutable identity.
+/// </summary>
+public sealed record FrozenAgentTemplate(
+    string Id,
+    string Layer,
+    string Role,
+    IReadOnlyList<string> Capabilities,
+    IReadOnlyList<string> AllowedTools,
+    Guid AgentDefinitionId,
+    Guid AgentVersionId,
+    string VersionContentHash);
 
 /// <summary>
 /// Run-frozen limits for generated agents. The durable engine supplies these values
@@ -98,9 +115,9 @@ public sealed class AgentCandidatePipelineRequiredException : InvalidOperationEx
 }
 
 /// <summary>Wire-compatible spawn intent that is deliberately fail-closed.</summary>
-public sealed class AgentProfilePromotionDisabledException : InvalidOperationException
+public sealed class AgentPromotionDisabledException : InvalidOperationException
 {
-    public AgentProfilePromotionDisabledException()
+    public AgentPromotionDisabledException()
         : base("Persistent profile promotion is disabled; generated agents must pass candidate sanitization, evaluation, review, publish, canary, and activation.")
     {
     }
@@ -182,7 +199,9 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         var parentDefinition = await ReadDefinitionAsync(parent, cancellationToken).ConfigureAwait(false);
         var intent = request.Intent;
         if (intent == AgentCreationIntent.PersistentProfile)
-            throw new AgentProfilePromotionDisabledException();
+            throw new AgentPromotionDisabledException();
+        if (request.Template is not null && intent != AgentCreationIntent.Temporary)
+            throw new InvalidOperationException("Frozen agent templates may only create temporary run instances.");
         var requiredCapability = intent switch
         {
             AgentCreationIntent.PersistentCandidate => "agent.create_persistent",
@@ -212,6 +231,12 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         var resources = Normalize(request.AllowedResources);
         if (!IsSubset(tools, parentDefinition.AllowedTools) || !IsSubset(resources, parentDefinition.AllowedResources))
             throw new UnauthorizedAccessException("Child agent permissions cannot exceed its parent instance.");
+        if (request.Template is { } requestedTemplate)
+        {
+            ValidateTemplate(requestedTemplate);
+            if (!IsSubset(tools, requestedTemplate.AllowedTools))
+                throw new UnauthorizedAccessException("Child agent permissions cannot exceed its frozen specialist template.");
+        }
         if (!string.IsNullOrWhiteSpace(request.ModelRoutePurpose) && !string.Equals(request.ModelRoutePurpose, parentDefinition.ModelRoutePurpose, StringComparison.OrdinalIgnoreCase))
             throw new UnauthorizedAccessException("Child agent cannot select a different model route from its parent.");
         var activeChildren = await db.Instances.CountAsync(x => x.RunId == parent.RunId && x.Generated && (x.Status == "created" || x.Status == "running"), cancellationToken).ConfigureAwait(false);
@@ -251,13 +276,15 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
             return ToRuntime(tempRow, tempDefinition);
         }
 
+        var template = request.Template;
         var definition = new AgentInstanceDefinition(
-            "generated.worker", "execution", string.IsNullOrWhiteSpace(request.Role) ? "worker" : request.Role.Trim(),
-            parentDefinition.ModelRoutePurpose, [], tools, resources, Math.Clamp(request.BudgetTokens, 0, parentDefinition.BudgetTokens),
+            template?.Id ?? "generated.worker", "execution", template?.Role ?? (string.IsNullOrWhiteSpace(request.Role) ? "worker" : request.Role.Trim()),
+            parentDefinition.ModelRoutePurpose, template?.Capabilities ?? [], tools, resources, Math.Clamp(request.BudgetTokens, 0, parentDefinition.BudgetTokens),
             DirectUserOutput: false, FormalMemoryWrite: false, request.Goal.Trim(), Normalize(request.SuccessCriteria), Normalize(request.ContextSelectors));
         var stored = await PutDefinitionAsync(scope.TenantId, scope.WorkspaceId, definition, cancellationToken).ConfigureAwait(false);
-        var binding = ResolveBinding(definition.Id, parent.AgentDefinitionId, parent.AgentVersionId,
-            parent.AgentVersionHash, stored.Sha256);
+        var binding = template is null
+            ? ResolveBinding(definition.Id, parent.AgentDefinitionId, parent.AgentVersionId, parent.AgentVersionHash, stored.Sha256)
+            : ResolveBinding(definition.Id, template.AgentDefinitionId, template.AgentVersionId, template.VersionContentHash, stored.Sha256);
         var now = DateTimeOffset.UtcNow;
         var row = new AgentInstanceRecord
         {
@@ -282,6 +309,22 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         rows.Sort((a, b) => a.CreatedAt.CompareTo(b.CreatedAt));
         var result = new List<RuntimeAgentInstance>(rows.Count);
         foreach (var row in rows) result.Add(ToRuntime(row, await ReadDefinitionAsync(row, cancellationToken).ConfigureAwait(false)));
+        return result;
+    }
+
+    public async Task<IReadOnlyList<RuntimeAgentInstance>> ListAllAsync(CancellationToken cancellationToken = default)
+    {
+        var scope = _tenant.Current;
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var rows = await db.Instances.AsNoTracking()
+            .Where(x => x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        rows.Sort((a, b) => a.CreatedAt != b.CreatedAt
+            ? a.CreatedAt.CompareTo(b.CreatedAt)
+            : a.Id.CompareTo(b.Id));
+        var result = new List<RuntimeAgentInstance>(rows.Count);
+        foreach (var row in rows)
+            result.Add(ToRuntime(row, await ReadDefinitionAsync(row, cancellationToken).ConfigureAwait(false)));
         return result;
     }
 
@@ -385,44 +428,6 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
             ?? throw new KeyNotFoundException("Agent candidate was not found.");
         if (candidate.Status != "proposed") throw new InvalidOperationException("Candidate has already been decided.");
         candidate.Status = decision; candidate.DecisionReason = reason; candidate.DecidedByPrincipalId = scope.PrincipalId; candidate.UpdatedAt = DateTimeOffset.UtcNow;
-        if (decision == "promoted")
-        {
-            var profileBody = await ReadCandidateProfileAsync(candidate, cancellationToken).ConfigureAwait(false);
-            var stored = await PutJsonAsync(scope.TenantId, scope.WorkspaceId, "agent-profile", profileBody, cancellationToken).ConfigureAwait(false);
-            var profile = new AgentProfileRecord
-            {
-                Id = Guid.NewGuid(),
-                TenantId = scope.TenantId,
-                WorkspaceId = scope.WorkspaceId,
-                ProjectId = candidate.ProjectId,
-                Scope = candidate.ProjectId is null ? "workspace" : "project",
-                Name = candidate.Name,
-                Layer = candidate.Layer,
-                AgentType = candidate.AgentType,
-                Enabled = true,
-                IsBuiltIn = false,
-                Revision = 1,
-                CreatedByPrincipalId = scope.PrincipalId,
-                UpdatedByPrincipalId = scope.PrincipalId,
-                CreatedAt = candidate.UpdatedAt,
-                UpdatedAt = candidate.UpdatedAt
-            };
-            var version = new AgentProfileVersionRecord
-            {
-                Id = Guid.NewGuid(),
-                AgentId = profile.Id,
-                Version = 1,
-                ContentReference = stored.Value,
-                ContentHash = stored.Sha256,
-                ContentLength = stored.Length,
-                CreatedByPrincipalId = scope.PrincipalId,
-                CreatedAt = candidate.UpdatedAt
-            };
-            profile.CurrentVersionId = version.Id;
-            candidate.PromotedAgentId = profile.Id;
-            db.Agents.Add(profile);
-            db.Versions.Add(version);
-        }
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return candidate;
     }
@@ -497,6 +502,16 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         var parentSet = parent.ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (parentSet.Contains("*")) return true;
         return child.All(parentSet.Contains);
+    }
+
+    private static void ValidateTemplate(FrozenAgentTemplate template)
+    {
+        if (string.IsNullOrWhiteSpace(template.Id) || string.IsNullOrWhiteSpace(template.Role))
+            throw new ArgumentException("Frozen agent template id and role are required.", nameof(template));
+        if (!string.Equals(template.Layer, "execution", StringComparison.Ordinal))
+            throw new ArgumentException("Frozen worker templates must be execution-layer agents.", nameof(template));
+        if (template.AgentDefinitionId == Guid.Empty || template.AgentVersionId == Guid.Empty || string.IsNullOrWhiteSpace(template.VersionContentHash))
+            throw new ArgumentException("Frozen worker template identity is incomplete.", nameof(template));
     }
 
     private static AgentVersionBinding ResolveBinding(

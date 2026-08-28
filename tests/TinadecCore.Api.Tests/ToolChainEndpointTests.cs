@@ -7,8 +7,12 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using TinadecCore.Abstractions.Ports;
+using TinadecCore.AgentConfiguration;
+using TinadecCore.Contracts.Dtos;
 using TinadecCore.DmaEA;
+using TinadecCore.Persistence;
 
 namespace TinadecCore.Api.Tests;
 
@@ -53,12 +57,13 @@ public sealed class ToolChainEndpointTests : IAsyncLifetime
         var workspace = Path.Combine(_root, "workspace");
         Directory.CreateDirectory(workspace);
         var script = new ToolScriptedClient()
-            .WhenPlanner("[{\"task_key\":\"write-probe\",\"title\":\"写探针文件\",\"description\":\"创建 probe.txt\",\"success_criteria\":[\"文件存在\"],\"dependencies\":[],\"required_capabilities\":[],\"required_tools\":[\"write_file\"],\"priority\":1,\"risk\":\"low\"}]")
+            .WhenPlanner("[{\"task_key\":\"write-probe\",\"title\":\"写探针文件\",\"description\":\"创建 probe.txt\",\"success_criteria\":[\"文件存在\"],\"dependencies\":[],\"required_capabilities\":[\"tool.file\"],\"required_tools\":[\"write_file\"],\"priority\":1,\"risk\":\"low\"}]")
             .WhenSupervisor("{\"decision\":\"pass\",\"reasons\":[\"ok\"],\"revise_task_indexes\":[]}")
             .WhenMeeting("文件已写入。");
 
         _factory = new ToolChainFactory(_root, script);
         var client = _factory.CreateClient();
+        var packDetail = await InstallOfficeAgentPackAsync(client);
 
         var project = await (await client.PostAsJsonAsync("/api/v1/projects", new { name = "Tool project", path = workspace })).Content.ReadFromJsonAsync<JsonElement>();
         var session = await (await client.PostAsJsonAsync("/api/v1/sessions", new { project_id = project.GetProperty("id").GetGuid(), title = "Tool session" })).Content.ReadFromJsonAsync<JsonElement>();
@@ -72,14 +77,194 @@ public sealed class ToolChainEndpointTests : IAsyncLifetime
         var decideResponse = await client.PostAsJsonAsync($"/api/v1/approvals/{approvalId}/decision", new { decision = "approved" });
         Assert.Equal(HttpStatusCode.OK, decideResponse.StatusCode);
 
-        var chunks = await active.Completion.WaitAsync(TimeSpan.FromSeconds(60));
-        var done = Assert.Single(chunks.Where(chunk => KindOf(chunk) == "done"));
+        List<JsonElement> chunks;
+        try
+        {
+            chunks = await active.Completion.WaitAsync(TimeSpan.FromSeconds(60));
+        }
+        catch (TimeoutException ex)
+        {
+            var orchestrationState = await client.GetStringAsync($"/api/v1/runs/{runId}/orchestration");
+            var executionState = await client.GetStringAsync($"/api/v1/sessions/{sessionId}/tool-executions");
+            throw new TimeoutException(
+                $"Run {runId} did not complete after approval.\nOrchestration: {orchestrationState}\nToolExecutions: {executionState}",
+                ex);
+        }
+        var done = Assert.Single(chunks, chunk => KindOf(chunk) == "done");
         Assert.Equal(runId, done.GetProperty("run_id").GetGuid());
 
         Assert.Equal("hello", await File.ReadAllTextAsync(Path.Combine(workspace, "probe.txt")));
 
         var orchestration = await client.GetFromJsonAsync<JsonElement>($"/api/v1/runs/{runId}/orchestration");
         Assert.Equal("completed", orchestration.GetProperty("run").GetProperty("status").GetString());
+        var expectedVersions = packDetail.GetProperty("resources").EnumerateArray()
+            .Where(resource => resource.GetProperty("kind").GetString() == "agent")
+            .ToDictionary(
+                resource => resource.GetProperty("resource_key").GetString()!,
+                resource => resource.GetProperty("version_id").GetGuid(),
+                StringComparer.Ordinal);
+        var lineage = await client.GetFromJsonAsync<JsonElement[]>($"/api/v1/runs/{runId}/agent-lineage");
+        Assert.Contains(lineage!, instance =>
+            instance.GetProperty("generated").GetBoolean()
+            && HasAgentVersion(instance, expectedVersions["worker.file"]));
+        Assert.Contains(lineage!, instance =>
+            instance.GetProperty("role").GetString() == "quality_controller"
+            && HasAgentVersion(instance, expectedVersions["supervisor"]));
+        Assert.Contains(lineage!, instance =>
+            instance.GetProperty("role").GetString() == "session_coordinator"
+            && HasAgentVersion(instance, expectedVersions["meeting"]));
+    }
+
+    private static bool HasAgentVersion(JsonElement instance, Guid expectedVersionId) =>
+        instance.TryGetProperty("agent_version_id", out var versionId)
+        && versionId.ValueKind == JsonValueKind.String
+        && versionId.TryGetGuid(out var actualVersionId)
+        && actualVersionId == expectedVersionId;
+
+    /// <summary>
+    /// The generic <see cref="IToolProvider"/> contract must be decoupled from the
+    /// TinadecTools child process: with the provider replaced in DI, the full
+    /// approval -> resume -> dispatch loop completes and Core never touches the
+    /// real process (the fake writes nothing to the workspace).
+    /// </summary>
+    [Fact]
+    public async Task WorkerWriteFile_ThroughInProcessFakeProvider_DispatchLoopCompletesWithoutTinadecTools()
+    {
+        var workspace = Path.Combine(_root, "workspace");
+        Directory.CreateDirectory(workspace);
+        var provider = new FakeToolProvider();
+        var script = new ToolScriptedClient()
+            .WhenPlanner("[{\"task_key\":\"write-probe\",\"title\":\"写探针文件\",\"description\":\"创建 probe.txt\",\"success_criteria\":[\"文件存在\"],\"dependencies\":[],\"required_capabilities\":[\"tool.file\"],\"required_tools\":[\"write_file\"],\"priority\":1,\"risk\":\"low\"}]")
+            .WhenSupervisor("{\"decision\":\"pass\",\"reasons\":[\"ok\"],\"revise_task_indexes\":[]}")
+            .WhenMeeting("文件已写入。");
+
+        _factory = new ToolChainFactory(_root, script, provider);
+        var client = _factory.CreateClient();
+        await InstallOfficeAgentPackAsync(client);
+
+        var project = await (await client.PostAsJsonAsync("/api/v1/projects", new { name = "Fake provider project", path = workspace })).Content.ReadFromJsonAsync<JsonElement>();
+        var session = await (await client.PostAsJsonAsync("/api/v1/sessions", new { project_id = project.GetProperty("id").GetGuid(), title = "Fake provider session" })).Content.ReadFromJsonAsync<JsonElement>();
+        var sessionId = session.GetProperty("id").GetGuid();
+
+        var active = StartStreamingInvoke(client, sessionId, new { content = "写一个文件", client_message_id = "fake-provider-c-1" });
+        var ack = await active.Acknowledgement.WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+        var runId = ack.GetProperty("run_id").GetGuid();
+
+        var approvalId = await WaitForPendingApprovalAsync(client, sessionId, runId, TimeSpan.FromSeconds(45));
+        var decideResponse = await client.PostAsJsonAsync($"/api/v1/approvals/{approvalId}/decision", new { decision = "approved" });
+        Assert.Equal(HttpStatusCode.OK, decideResponse.StatusCode);
+
+        var chunks = await active.Completion.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+        var done = Assert.Single(chunks, chunk => KindOf(chunk) == "done");
+        Assert.Equal(runId, done.GetProperty("run_id").GetGuid());
+
+        Assert.Equal(1, provider.CallCount);
+        Assert.Equal("write_file", Assert.Single(provider.ReceivedToolIds));
+        Assert.True(provider.ReceivedApproved);
+        Assert.False(File.Exists(Path.Combine(workspace, "probe.txt")));
+
+        var orchestration = await client.GetFromJsonAsync<JsonElement>($"/api/v1/runs/{runId}/orchestration").ConfigureAwait(false);
+        Assert.Equal("completed", orchestration.GetProperty("run").GetProperty("status").GetString());
+    }
+
+    private sealed class FakeToolProvider : IToolProvider
+    {
+        private readonly object _lock = new();
+
+        public int CallCount { get; private set; }
+        public List<string> ReceivedToolIds { get; } = [];
+        public bool ReceivedApproved { get; private set; }
+
+        public Task<ToolManifestDto> EnsureStartedAsync(string workspaceRoot, CancellationToken cancellationToken = default) =>
+            Task.FromResult(CreateManifest());
+
+        public Task<ToolWireResponseDto> CallAsync(
+            string workspaceRoot,
+            ToolWireRequestDto request,
+            TimeSpan? timeout = null,
+            CancellationToken cancellationToken = default)
+        {
+            lock (_lock)
+            {
+                CallCount++;
+                ReceivedToolIds.Add(request.ToolId);
+                ReceivedApproved |= request.Approved;
+            }
+            return Task.FromResult(new ToolWireResponseDto
+            {
+                CallId = request.ToolCallId,
+                IsSuccess = true,
+                Result = JsonSerializer.SerializeToElement(new { ok = true, tool = request.ToolId })
+            });
+        }
+
+        public Task<ToolManifestDto> GetManifestAsync(string workspaceRoot, CancellationToken cancellationToken = default) =>
+            Task.FromResult(CreateManifest());
+
+        public Task ShutdownAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        private static ToolManifestDto CreateManifest()
+        {
+            var tools = new List<ToolManifestEntryDto>
+            {
+                new()
+                {
+                    Id = "write_file",
+                    Description = "In-process fake write probe",
+                    RequiresApproval = true,
+                    Risk = "medium",
+                    MutatesWorkspace = true
+                }
+            };
+            return new ToolManifestDto
+            {
+                ProtocolVersion = 2,
+                ManifestHash = ToolManifestHasher.Compute(tools),
+                Tools = tools
+            };
+        }
+    }
+
+    private static async Task<JsonElement> InstallOfficeAgentPackAsync(HttpClient client)
+    {
+        var manifest = JsonSerializer.Deserialize<JsonElement>(
+            await File.ReadAllTextAsync(FindOfficeManifestPath(), Encoding.UTF8));
+        var digest = Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(JsonCanonicalizer.Canonicalize(manifest)))
+            .ToLowerInvariant();
+        var envelope = JsonSerializer.SerializeToElement(new
+        {
+            manifest,
+            integrity = new { algorithm = "sha256", digest }
+        });
+        using var previewResponse = await client.PostAsJsonAsync("/api/v1/agent-packs/install-preview", envelope);
+        previewResponse.EnsureSuccessStatusCode();
+        var preview = await previewResponse.Content.ReadFromJsonAsync<JsonElement>();
+        using var apply = new HttpRequestMessage(HttpMethod.Put, "/api/v1/agent-packs/tinadec.office.agent-pack")
+        {
+            Content = JsonContent.Create(new { preview_id = preview.GetProperty("preview_id").GetGuid(), envelope })
+        };
+        apply.Headers.TryAddWithoutValidation("Idempotency-Key", "tool-chain-office-pack-install");
+        using var applyResponse = await client.SendAsync(apply);
+        Assert.Equal(HttpStatusCode.Created, applyResponse.StatusCode);
+        return await client.GetFromJsonAsync<JsonElement>("/api/v1/agent-packs/tinadec.office.agent-pack");
+    }
+
+    private static string FindOfficeManifestPath()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var candidate = Path.Combine(
+                directory.FullName,
+                "apps",
+                "desktop",
+                "src",
+                "agentPacks",
+                "OfficeAgentPack",
+                "manifest.json");
+            if (File.Exists(candidate)) return candidate;
+        }
+        throw new FileNotFoundException("OfficeAgentPack manifest.json was not found from the test output directory.");
     }
 
     private static async Task<Guid> WaitForPendingApprovalAsync(HttpClient client, Guid sessionId, Guid runId, TimeSpan timeout)
@@ -87,7 +272,7 @@ public sealed class ToolChainEndpointTests : IAsyncLifetime
         var deadline = DateTimeOffset.UtcNow + timeout;
         while (DateTimeOffset.UtcNow < deadline)
         {
-            var approvals = await client.GetFromJsonAsync<JsonElement[]>("/api/v1/approvals?status=pending");
+            var approvals = await client.GetFromJsonAsync<JsonElement[]>("/api/v1/approvals?status=pending") ?? [];
             var match = approvals.FirstOrDefault(item =>
                 item.GetProperty("run_id").ValueKind == JsonValueKind.String
                 && Guid.TryParse(item.GetProperty("run_id").GetString(), out var candidate) && candidate == runId);
@@ -199,7 +384,9 @@ public sealed class ToolChainEndpointTests : IAsyncLifetime
         {
             var prompt = string.Join('\n', messages.Select(m => m.Text));
             var instructions = options?.Instructions;
-            if (instructions?.Contains("规划层", StringComparison.Ordinal) == true || prompt.Contains("规划", StringComparison.Ordinal) && !prompt.Contains("执行证据", StringComparison.Ordinal))
+            if (instructions?.Contains("任务规划智能体", StringComparison.Ordinal) == true
+                || instructions?.Contains("规划层", StringComparison.Ordinal) == true
+                || prompt.Contains("规划", StringComparison.Ordinal) && !prompt.Contains("执行证据", StringComparison.Ordinal))
                 return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, _planner ?? "[]")));
             if (instructions?.Contains("监督智能体", StringComparison.Ordinal) == true || prompt.Contains("执行证据", StringComparison.Ordinal))
                 return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant,
@@ -232,11 +419,13 @@ public sealed class ToolChainEndpointTests : IAsyncLifetime
     {
         private readonly string _root;
         private readonly ToolScriptedClient _client;
+        private readonly IToolProvider? _providerOverride;
 
-        public ToolChainFactory(string root, ToolScriptedClient client)
+        public ToolChainFactory(string root, ToolScriptedClient client, IToolProvider? providerOverride = null)
         {
             _root = root;
             _client = client;
+            _providerOverride = providerOverride;
         }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -251,6 +440,11 @@ public sealed class ToolChainEndpointTests : IAsyncLifetime
             builder.ConfigureServices(services =>
             {
                 services.AddSingleton<IAgentChatClientFactory>(new ToolScriptedFactory(_client));
+                services.AddSingleton<ISecretStore>(new TestModelSecretStore());
+                if (_providerOverride is not null)
+                {
+                    services.Replace(ServiceDescriptor.Singleton<IToolProvider>(_providerOverride));
+                }
             });
         }
     }
