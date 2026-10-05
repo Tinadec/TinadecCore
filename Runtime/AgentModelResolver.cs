@@ -72,6 +72,19 @@ internal sealed class AgentModelResolver : IAgentModelResolver
 
         Consider("request_strategy", request.Strategy);
 
+        // 用户级运行时绑定（配置体验改造 A）：与 FormalModeResolver.ResolveRosterAsync
+        // 采用同一优先级模型——user_binding > mode_node_override > agent_version。预览路径
+        // 此前缺这一档，导致智能体中心保存绑定后 effective_previews 仍反映保存前的解析链，
+        // 用户读作“设置成功但没生效”。以 AgentDefinitionId 守卫：InteractionsEndpoints 的
+        // meeting-root 预览只传 MeetingModelOverride，不受影响。
+        if (request.AgentDefinitionId is { } bindingAgentId)
+        {
+            await using var db = await _agents.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            var binding = await db.AgentRuntimeBindings.AsNoTracking().SingleOrDefaultAsync(x => x.AgentDefinitionId == bindingAgentId
+                && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId, cancellationToken).ConfigureAwait(false);
+            Consider("user_binding", BindingToStrategy(binding));
+        }
+
         if (request.ModeVersionId is { } modeVersionId && !string.IsNullOrWhiteSpace(request.NodeKey))
         {
             await using var db = await _agents.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
@@ -112,11 +125,26 @@ internal sealed class AgentModelResolver : IAgentModelResolver
         };
     }
 
+    /// <summary>
+    /// 把用户级运行时绑定映射为模型策略：fixed 带 provider(+可选 model)，route 带用途，
+    /// inherit / 空绑定返回 null 使 Consider 跳过。fixed 的 model 允许为 null（CLI/ACP
+    /// 运行时），与 FormalModeResolver 的解析口径一致。
+    /// </summary>
+    private static ModelStrategyDto? BindingToStrategy(AgentRuntimeBindingRecord? binding)
+    {
+        if (binding is null) return null;
+        if (binding.Mode == "fixed" && binding.ProviderInstanceId is { } provider)
+            return new ModelStrategyDto { Kind = ModelStrategyKinds.Fixed, ProviderInstanceId = provider, Model = binding.Model };
+        if (binding.Mode == "route" && !string.IsNullOrWhiteSpace(binding.RoutePurpose))
+            return new ModelStrategyDto { Kind = ModelStrategyKinds.Route, RoutePurpose = binding.RoutePurpose };
+        return null;
+    }
+
     public async Task<FrozenModelPlan> FreezeAsync(AgentModelFreezeRequest request, CancellationToken cancellationToken = default)
     {
         var strategy = ModelStrategyJson.Parse(request.StrategyJson);
         var source = request.StrategySource;
-        if (request.IsMeetingRoot)
+        if (request.IsConversationRoot)
         {
             var meetingOverride = request.MeetingModelOverride;
             if (meetingOverride is not null)
@@ -134,7 +162,7 @@ internal sealed class AgentModelResolver : IAgentModelResolver
                 }
             }
         }
-        return await FreezeStrategyAsync(strategy, source, !request.IsMeetingRoot && strategy.Kind == ModelStrategyKinds.Inherit, cancellationToken).ConfigureAwait(false);
+        return await FreezeStrategyAsync(strategy, source, !request.IsConversationRoot && strategy.Kind == ModelStrategyKinds.Inherit, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<ChatResolution>> ResolveInvocationCandidatesAsync(FrozenModelPlan plan, Guid? parentInstanceId, CancellationToken cancellationToken = default)
@@ -253,8 +281,8 @@ internal sealed class AgentModelResolver : IAgentModelResolver
             var providerVersion = await db.ProviderVersions.AsNoTracking().SingleOrDefaultAsync(x => x.Id == provider.CurrentVersionId, ct).ConfigureAwait(false)
                 ?? throw new InvalidDataException($"Provider '{providerId}' has no current version.");
             var protocol = await ReadProtocolAsync(provider, providerVersion, ct).ConfigureAwait(false);
-            if (string.IsNullOrWhiteSpace(strategy.Model) && protocol is not (ChatProtocols.Acp or ChatProtocols.OpencodeServe))
-                throw new InvalidDataException("fixed model strategy requires model for non-runtime providers.");
+            if (string.IsNullOrWhiteSpace(strategy.Model) && !ChatProtocols.IsModelChosenByHarness(protocol))
+                throw new InvalidDataException($"fixed model strategy requires model unless the harness chooses it (protocol '{protocol}').");
             return new FrozenModelPlan(ModelStrategyKinds.Fixed, source,
                 [new FrozenModelCandidate(0, provider.Id, providerVersion.Id, strategy.Model, protocol)]);
         }
@@ -302,14 +330,29 @@ internal sealed class AgentModelResolver : IAgentModelResolver
             var root = document.RootElement;
             string? Text(string key) => root.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
             var protocol = candidate.Protocol;
-            var runtimeOwned = protocol is ChatProtocols.Acp or ChatProtocols.OpencodeServe;
+            var processBacked = ChatProtocols.IsProcessTransport(protocol);
+            var harnessOwned = processBacked || protocol == ChatProtocols.OpencodeServe;
             var model = candidate.Model ?? Text("model");
-            if (string.IsNullOrWhiteSpace(model) && !runtimeOwned) return Unavailable(candidate, source, "model_missing", "Model id is missing.");
+            if (string.IsNullOrWhiteSpace(model) && !harnessOwned) return Unavailable(candidate, source, "model_missing", "Model id is missing.");
             model ??= provider.Driver;
-            var baseUrl = runtimeOwned ? Text("server_url") : Text("base_url");
-            if (string.IsNullOrWhiteSpace(baseUrl)) return Unavailable(candidate, source, "endpoint_missing", "Provider endpoint is missing.");
+            string? baseUrl;
+            if (processBacked)
+            {
+                // A process-backed harness is reached by spawning binary_path and talking to its
+                // stdio. Requiring an endpoint here is what silently killed every stdio ACP provider:
+                // the route failed with `endpoint_missing` and named nothing that was actually wrong.
+                if (string.IsNullOrWhiteSpace(Text("binary_path")))
+                    return Unavailable(candidate, source, "binary_missing", $"'{protocol}' runs as a local process and needs binary_path.");
+                baseUrl = null;
+            }
+            else
+            {
+                baseUrl = protocol == ChatProtocols.OpencodeServe ? Text("server_url") : Text("base_url");
+                if (string.IsNullOrWhiteSpace(baseUrl))
+                    return Unavailable(candidate, source, "endpoint_missing", protocol == ChatProtocols.OpencodeServe ? "CLI runtime server_url is missing." : "Provider endpoint is missing.");
+            }
             string? apiKey = null;
-            if (!runtimeOwned)
+            if (!harnessOwned)
             {
                 if (string.IsNullOrWhiteSpace(provider.SecretReference)) return Unavailable(candidate, source, "credential_missing", "Provider credential is not configured.");
                 apiKey = await _secrets.GetAsync(provider.SecretReference, ct).ConfigureAwait(false);
@@ -318,6 +361,7 @@ internal sealed class AgentModelResolver : IAgentModelResolver
             return new ChatResolution
             {
                 IsAvailable = true, BaseUrl = baseUrl, ApiKey = apiKey, Model = model,
+                Parameters = ModelParameters.ForModel(root, model),
                 ModelId = $"{provider.Driver}/{model}", Protocol = protocol,
                 ServerUrl = Text("server_url"), BinaryPath = Text("binary_path"), LaunchArgs = Text("launch_args"), HomePath = Text("home_path"),
                 ProviderInstanceId = provider.Id, ProviderVersionId = version.Id,
@@ -344,6 +388,7 @@ internal sealed class AgentModelResolver : IAgentModelResolver
         IsAvailable = value.IsAvailable,
         BaseUrl = value.BaseUrl,
         Model = value.Model,
+        Parameters = value.Parameters,
         ApiKey = value.ApiKey,
         ModelId = value.ModelId,
         Protocol = value.Protocol,
@@ -365,8 +410,8 @@ internal sealed class AgentModelResolver : IAgentModelResolver
     {
         await using var stream = await _content.OpenReadAsync(new ContentReference(version.ContentReference, version.ContentHash, version.ContentLength, "application/json"), ct).ConfigureAwait(false);
         using var document = await JsonDocument.ParseAsync(stream, cancellationToken: ct).ConfigureAwait(false);
-        var configured = document.RootElement.TryGetProperty("protocol", out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
-        return ChatProtocols.Normalize(configured ?? ChatProtocols.InferFromDriver(provider.Driver));
+        string? Text(string key) => document.RootElement.TryGetProperty(key, out var property) && property.ValueKind == JsonValueKind.String ? property.GetString() : null;
+        return HarnessCatalog.ResolveProtocol(Text("protocol"), provider.Driver, Text("channel"));
     }
 
     private static ModelStrategyDto? ReadModeNodeStrategy(string? snapshot, string nodeKey)

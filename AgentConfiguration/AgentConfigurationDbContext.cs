@@ -20,6 +20,7 @@ public sealed class AgentConfigurationDbContext : DbContext
 
     public DbSet<AgentDefinitionRecord> AgentDefinitions => Set<AgentDefinitionRecord>();
     public DbSet<AgentVersionRecord> AgentVersions => Set<AgentVersionRecord>();
+    public DbSet<AgentRuntimeBindingRecord> AgentRuntimeBindings => Set<AgentRuntimeBindingRecord>();
     public DbSet<AgentModeRecord> AgentModes => Set<AgentModeRecord>();
     public DbSet<ModeVersionRecord> ModeVersions => Set<ModeVersionRecord>();
     public DbSet<ModeNodeRecord> ModeNodes => Set<ModeNodeRecord>();
@@ -36,6 +37,11 @@ public sealed class AgentConfigurationDbContext : DbContext
     public DbSet<AgentPackPreviewRecord> AgentPackPreviews => Set<AgentPackPreviewRecord>();
     public DbSet<AgentPackDefaultAdoptionRecord> AgentPackDefaultAdoptions => Set<AgentPackDefaultAdoptionRecord>();
     public DbSet<AgentPackOperationRecord> AgentPackOperations => Set<AgentPackOperationRecord>();
+    public DbSet<AgentTemplateRecord> AgentTemplates => Set<AgentTemplateRecord>();
+    public DbSet<AgentTemplateVersionRecord> AgentTemplateVersions => Set<AgentTemplateVersionRecord>();
+    public DbSet<ModeBindingRecord> ModeBindings => Set<ModeBindingRecord>();
+    public DbSet<ToolDefinitionRecord> ToolDefinitions => Set<ToolDefinitionRecord>();
+    public DbSet<ToolDefinitionVersionRecord> ToolDefinitionVersions => Set<ToolDefinitionVersionRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -74,6 +80,19 @@ public sealed class AgentConfigurationDbContext : DbContext
             entity.Property(x => x.Revision).IsConcurrencyToken();
             entity.HasIndex(x => new { x.AgentDefinitionId, x.Version }).IsUnique();
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.AgentDefinitionId, x.CreatedAt });
+        });
+
+        modelBuilder.Entity<AgentRuntimeBindingRecord>(entity =>
+        {
+            entity.ToTable("agent_runtime_bindings");
+            entity.HasKey(x => x.AgentDefinitionId);
+            entity.Property(x => x.Mode).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.ProviderInstanceId).HasColumnName("provider_instance_id");
+            entity.Property(x => x.Model).HasMaxLength(256);
+            entity.Property(x => x.RoutePurpose).HasMaxLength(128);
+            entity.Property(x => x.ToolScopeOverrideJson).HasMaxLength(4096);
+            entity.Property(x => x.UpdatedByPrincipalId).HasColumnName("updated_by_principal_id");
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.UpdatedAt });
         });
 
         modelBuilder.Entity<AgentModeRecord>(entity =>
@@ -271,6 +290,84 @@ public sealed class AgentConfigurationDbContext : DbContext
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.PrincipalId, x.Operation, x.IdempotencyKey }).IsUnique();
         });
 
+        // DmaEA graph orchestration (Phase 1): template / mode-binding / tool-definition
+        // model alongside the legacy agent_definitions wide table. Same column covenant
+        // as every table in this context: tenant_id/workspace_id/revision/status/timestamps.
+        modelBuilder.Entity<AgentTemplateRecord>(entity =>
+        {
+            entity.ToTable("agent_templates");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Slug).HasMaxLength(128).IsRequired();
+            entity.Property(x => x.DisplayName).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.Layer).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.Role).HasMaxLength(128).IsRequired();
+            entity.Property(x => x.CapabilitiesJson).HasMaxLength(4096);
+            entity.Property(x => x.ModelStrategyJson).HasMaxLength(4096);
+            entity.Property(x => x.DefaultToolScopeJson).HasMaxLength(4096);
+            entity.Property(x => x.Description).HasMaxLength(2048);
+            entity.Property(x => x.SourceKind).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.SourceKey).HasMaxLength(512).IsRequired();
+            entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.Revision).IsConcurrencyToken();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Slug }).IsUnique().HasFilter("status = 'draft'");
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Status, x.UpdatedAt });
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.SourceKind, x.SourceKey }).IsUnique();
+        });
+
+        modelBuilder.Entity<AgentTemplateVersionRecord>(entity =>
+        {
+            entity.ToTable("agent_template_versions");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.SnapshotJson).HasMaxLength(16384).IsRequired();
+            entity.Property(x => x.ContentHash).HasMaxLength(128);
+            entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.Revision).IsConcurrencyToken();
+            entity.HasIndex(x => new { x.AgentTemplateId, x.Version }).IsUnique();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.AgentTemplateId, x.CreatedAt });
+        });
+
+        modelBuilder.Entity<ModeBindingRecord>(entity =>
+        {
+            entity.ToTable("mode_bindings");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.NodeKey).HasMaxLength(128).IsRequired();
+            entity.Property(x => x.AgentTemplateSlug).HasMaxLength(128);
+            entity.Property(x => x.DutyDescriptionRef).HasMaxLength(512);
+            entity.Property(x => x.ToolSwitchesJson).HasMaxLength(4096);
+            entity.Property(x => x.EnvelopeJson).HasMaxLength(8192);
+            entity.Property(x => x.InstanceNamingJson).HasMaxLength(2048);
+            entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.Revision).IsConcurrencyToken();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.ModeId, x.NodeKey }).IsUnique().HasFilter("status = 'draft'");
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.ModeId, x.Status });
+        });
+
+        modelBuilder.Entity<ToolDefinitionRecord>(entity =>
+        {
+            entity.ToTable("tool_definitions");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Slug).HasMaxLength(128).IsRequired();
+            entity.Property(x => x.DisplayName).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.Description).HasMaxLength(2048);
+            entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.Revision).IsConcurrencyToken();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Slug }).IsUnique().HasFilter("status = 'draft'");
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Status, x.UpdatedAt });
+        });
+
+        modelBuilder.Entity<ToolDefinitionVersionRecord>(entity =>
+        {
+            entity.ToTable("tool_definition_versions");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.DefinitionJson).HasMaxLength(16384).IsRequired();
+            entity.Property(x => x.EntryHash).HasMaxLength(128);
+            entity.Property(x => x.ContentHash).HasMaxLength(128);
+            entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.Revision).IsConcurrencyToken();
+            entity.HasIndex(x => new { x.ToolDefinitionId, x.Version }).IsUnique();
+            entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.ToolDefinitionId, x.CreatedAt });
+        });
+
         modelBuilder.UseTinadecSnakeCase();
     }
 }
@@ -309,6 +406,29 @@ public sealed class AgentDefinitionRecord
     public DateTimeOffset UpdatedAt { get; set; }
     public DateTimeOffset? ArchivedAt { get; set; }
     public Guid CreatedByPrincipalId { get; set; }
+    public Guid UpdatedByPrincipalId { get; set; }
+}
+
+/// <summary>
+/// 用户级的智能体运行时绑定（配置体验改造 A）：模型来源（inherit/route/fixed）
+/// 与工具范围的"覆盖记录"。与 agent definition 的 draft/publish 分离——pack 管理
+/// 的智能体也可写，重装 pack 不丢失；冻结运行配置时优先生效。
+/// </summary>
+public sealed class AgentRuntimeBindingRecord
+{
+    public Guid AgentDefinitionId { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    // inherit | route | fixed
+    public string Mode { get; set; } = "inherit";
+    public Guid? ProviderInstanceId { get; set; }
+    public string? Model { get; set; }
+    // mode == route 时的 model_routes.purpose；其他模式为 null。
+    public string? RoutePurpose { get; set; }
+    // json: string[] — 覆盖 agent 定义的 tool_scope；null = 跟随定义
+    public string? ToolScopeOverrideJson { get; set; }
+    public long Revision { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
     public Guid UpdatedByPrincipalId { get; set; }
 }
 
@@ -602,4 +722,124 @@ public sealed class AgentPackOperationRecord
     public int StatusCode { get; set; }
     public string ResponseJson { get; set; } = string.Empty;
     public DateTimeOffset CreatedAt { get; set; }
+}
+
+// ─────────────────────────────────────────────
+// DmaEA graph orchestration records (Phase 1).
+// Three-layer model: AgentTemplate (duty defaults + capability ceiling) →
+// ModeBinding (per-mode duty file ref, tool switches, narrowing-only envelope,
+// instance naming) → runtime instances live in DmaEA. Tool definitions are the
+// controlled import registry: names/references only — secret values never land
+// in these rows (ISecretStore / .tinadec/sandbox.json carry values).
+// ─────────────────────────────────────────────
+
+public sealed class AgentTemplateRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public string Slug { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public string Layer { get; set; } = "execution";
+    public string Role { get; set; } = string.Empty;
+    public string? CapabilitiesJson { get; set; }
+    public string? ModelStrategyJson { get; set; }
+    public string? DefaultToolScopeJson { get; set; }
+    public string? Description { get; set; }
+    public string SourceKind { get; set; } = "pack";
+    public string SourceKey { get; set; } = string.Empty;
+    public bool Managed { get; set; }
+    public bool Enabled { get; set; } = true;
+    public string Status { get; set; } = "draft";
+    public long Revision { get; set; }
+    public int Version { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+    public DateTimeOffset? ArchivedAt { get; set; }
+    public Guid CreatedByPrincipalId { get; set; }
+    public Guid UpdatedByPrincipalId { get; set; }
+}
+
+public sealed class AgentTemplateVersionRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid AgentTemplateId { get; set; }
+    public int Version { get; set; }
+    public string SnapshotJson { get; set; } = string.Empty;
+    public string? ContentHash { get; set; }
+    public long ContentLength { get; set; }
+    public string Status { get; set; } = "published";
+    public long Revision { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public Guid CreatedByPrincipalId { get; set; }
+}
+
+public sealed class ModeBindingRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid ModeId { get; set; }
+    public Guid? ModeVersionId { get; set; }
+    public string NodeKey { get; set; } = string.Empty;
+    public Guid AgentTemplateId { get; set; }
+    public string? AgentTemplateSlug { get; set; }
+    // relationship description file reference (per-node duty contract)
+    public string? DutyDescriptionRef { get; set; }
+    // json: { "<tool_id>": true|false } — per-mode tool switches, narrowing only
+    public string? ToolSwitchesJson { get; set; }
+    // json: per-mode permission envelope (capabilities/tools/spawn budget deltas);
+    // can only narrow TOML ceilings and the operation-layer deny floor, never widen.
+    public string? EnvelopeJson { get; set; }
+    // R2: this mode legitimately relies on Core-reserved capabilities (e.g. the
+    // synthetic create_workspace ceiling that is deliberately not intersected with
+    // tool_scope); the publish gate skips the envelope containment check for them.
+    public bool IncludesCoreReserved { get; set; }
+    // json: instance naming strategy for derived instances of this node
+    public string? InstanceNamingJson { get; set; }
+    public string Status { get; set; } = "draft";
+    public long Revision { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+    public DateTimeOffset? ArchivedAt { get; set; }
+}
+
+public sealed class ToolDefinitionRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public string Slug { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public string? Description { get; set; }
+    public string Status { get; set; } = "draft";
+    public long Revision { get; set; }
+    public int Version { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+    public DateTimeOffset? ArchivedAt { get; set; }
+    public Guid CreatedByPrincipalId { get; set; }
+    public Guid UpdatedByPrincipalId { get; set; }
+}
+
+public sealed class ToolDefinitionVersionRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid ToolDefinitionId { get; set; }
+    public int Version { get; set; }
+    // definition manifest: names/refs/schema only — inline secret values are
+    // rejected by the publish gate, not stored here.
+    public string DefinitionJson { get; set; } = string.Empty;
+    // hash-pin to the live TinadecTools manifest entry this definition binds to
+    public string? EntryHash { get; set; }
+    public string? ContentHash { get; set; }
+    public long ContentLength { get; set; }
+    public string Status { get; set; } = "published";
+    public long Revision { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public Guid CreatedByPrincipalId { get; set; }
 }

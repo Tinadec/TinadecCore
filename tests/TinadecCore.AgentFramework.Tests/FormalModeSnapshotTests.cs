@@ -33,7 +33,7 @@ public sealed class FormalModeSnapshotTests
         Assert.DoesNotContain("v2", meeting.PromptGraphJson, StringComparison.Ordinal);
 
         var frozen = await fixture.Services.GetRequiredService<IAgentRuntimeConfigurationResolver>()
-            .ResolveAsync(fixture.SessionId, null, null, null);
+            .ResolveAsync(fixture.SessionId, "ask");
         Assert.Contains(frozen.Bindings, binding =>
             binding.ConfigurationKind == "agent_mode_version"
             && binding.ConfigurationVersionId == fixture.ModeVersionId);

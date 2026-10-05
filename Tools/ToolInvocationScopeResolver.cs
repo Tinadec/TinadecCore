@@ -15,6 +15,7 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
     private readonly IToolProvider _provider;
     private readonly ITenantContextAccessor _tenant;
     private readonly IAgentToolAuthorization? _agents;
+    private readonly IToolExecutionTargetResolver? _targets;
 
     public ToolInvocationScopeResolver(
         ILifecycleManager lifecycle,
@@ -28,6 +29,7 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
         _provider = provider;
         _tenant = tenant;
         _agents = services.GetService(typeof(IAgentToolAuthorization)) as IAgentToolAuthorization;
+        _targets = services.GetService(typeof(IToolExecutionTargetResolver)) as IToolExecutionTargetResolver;
     }
 
     public async Task<ToolInvocationScope> ResolveAsync(
@@ -53,12 +55,25 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
             ?? throw new KeyNotFoundException("Session was not found.");
         if (session.TenantId != tenantId || session.WorkspaceId != workspaceId)
             throw new UnauthorizedAccessException("Session does not belong to the run tenant/workspace.");
-        var project = await _sessions.FindProjectAsync(session.ProjectId, cancellationToken).ConfigureAwait(false)
-            ?? throw new KeyNotFoundException("Project was not found.");
-        if (project.TenantId != tenantId || project.WorkspaceId != workspaceId)
-            throw new UnauthorizedAccessException("Project does not belong to the run tenant/workspace.");
-        var root = Path.GetFullPath(project.RootPath);
-        if (!Directory.Exists(root)) throw new DirectoryNotFoundException("The project workspace root no longer exists.");
+
+        ProjectReference? project = null;
+        var root = string.Empty;
+        if (session.ProjectId is null)
+        {
+            // Free-conversation sessions expose only Core-owned virtual tools; every
+            // provider-backed tool requires a project root.
+            if (!CoreVirtualToolPolicy.IsCoreVirtual(request.ToolId))
+                throw new InvalidOperationException("Tool execution is unavailable for a session without a project workspace root.");
+        }
+        else
+        {
+            project = await _sessions.FindProjectAsync(session.ProjectId.Value, cancellationToken).ConfigureAwait(false)
+                ?? throw new KeyNotFoundException("Project was not found.");
+            if (project.TenantId != tenantId || project.WorkspaceId != workspaceId)
+                throw new UnauthorizedAccessException("Project does not belong to the run tenant/workspace.");
+            root = Path.GetFullPath(project.RootPath);
+            if (!Directory.Exists(root)) throw new DirectoryNotFoundException("The project workspace root no longer exists.");
+        }
 
         if (_agents is null)
             throw new InvalidOperationException("No agent authorization provider is registered.");
@@ -70,8 +85,10 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
             throw new UnauthorizedAccessException("Agent invocation scope does not match the run/session.");
         if (!IsToolAllowed(authorization.AllowedTools, request.ToolId))
             throw new UnauthorizedAccessException($"Agent instance is not allowed to invoke '{request.ToolId}'.");
-        if (!IsResourceAllowed(authorization.AllowedResources, root))
-            throw new UnauthorizedAccessException("Agent instance is not allowed to access the project workspace.");
+        // WS-4 resource envelope: a non-empty grant list authorizes the workspace
+        // root; read/write levels are enforced by the PDP resource_access boundary.
+        if (project is not null && !IsResourceAllowed(authorization.AllowedResources))
+            throw new UnauthorizedAccessException("Agent instance holds no workspace resource grant.");
 
         var frozen = await _lifecycle.GetFrozenRunConfigurationAsync(request.RunId.ToString(), cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException("Frozen run configuration body is unavailable.");
@@ -83,17 +100,36 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
             throw new InvalidOperationException("The run does not contain a valid frozen TinadecTools v2 manifest.");
         }
 
-        var liveManifest = await _provider.GetManifestAsync(root, cancellationToken).ConfigureAwait(false);
-        if (liveManifest.ProtocolVersion != 2
-            || !string.Equals(liveManifest.ManifestHash, frozenManifest.ManifestHash, StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(ToolManifestHasher.Compute(liveManifest.Tools), frozenManifest.ManifestHash, StringComparison.OrdinalIgnoreCase))
+        ToolExecutionTarget? executionTarget = null;
+        if (_targets is not null && project is not null)
         {
-            throw new InvalidOperationException("The TinadecTools manifest changed after run admission.");
+            var resolved = await _targets.ResolveAsync(sessionId, request.RunId, request.TaskId, request.ToolId, root, cancellationToken).ConfigureAwait(false);
+            if (resolved.IsRejected) throw new InvalidOperationException(resolved.Error);
+            executionTarget = resolved.Target;
         }
+        var providerRoot = executionTarget?.RootPath ?? root;
 
-        var liveEntry = liveManifest.Tools.FirstOrDefault(item => string.Equals(item.Id, request.ToolId, StringComparison.OrdinalIgnoreCase));
-        var frozenEntry = frozenManifest.Tools.FirstOrDefault(item => string.Equals(item.Id, request.ToolId, StringComparison.OrdinalIgnoreCase));
-        if (liveEntry is null || frozenEntry is null || !ToolManifestHasher.Equivalent(liveEntry, frozenEntry))
+        // A Core-owned virtual tool has no child-process entry to pair against, so the frozen
+        // manifest is its only declaration source here too - the same exemption the freezer applies
+        // when it builds that manifest. See CoreVirtualToolPolicy.RequiresLiveManifestEntry.
+        if (project is not null && CoreVirtualToolPolicy.RequiresLiveManifestEntry(request.ToolId))
+        {
+            var liveManifest = await _provider.GetManifestAsync(providerRoot, cancellationToken).ConfigureAwait(false);
+            if (liveManifest.ProtocolVersion != 2
+                || !string.Equals(liveManifest.ManifestHash, frozenManifest.ManifestHash, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(ToolManifestHasher.Compute(liveManifest.Tools), frozenManifest.ManifestHash, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("The TinadecTools manifest changed after run admission.");
+            }
+
+            var liveEntry = liveManifest.Tools.FirstOrDefault(item => string.Equals(item.Id, request.ToolId, StringComparison.OrdinalIgnoreCase));
+            var frozenPair = frozenManifest.Tools.FirstOrDefault(item => string.Equals(item.Id, request.ToolId, StringComparison.OrdinalIgnoreCase));
+            if (liveEntry is null || frozenPair is null || !ToolManifestHasher.Equivalent(liveEntry, frozenPair))
+            {
+                throw new UnauthorizedAccessException($"Tool '{request.ToolId}' is not in the frozen authorized manifest.");
+            }
+        }
+        else if (!frozenManifest.Tools.Any(item => string.Equals(item.Id, request.ToolId, StringComparison.OrdinalIgnoreCase)))
         {
             throw new UnauthorizedAccessException($"Tool '{request.ToolId}' is not in the frozen authorized manifest.");
         }
@@ -104,7 +140,7 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
             tenantId,
             workspaceId,
             _tenant.Current.PrincipalId,
-            project.ProjectId,
+            CoreVirtualToolPolicy.ToWireSentinel(project?.ProjectId),
             sessionId,
             request.RunId,
             request.TaskId,
@@ -117,7 +153,32 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
             policy.WorkerRetryLimit,
             policy.SerializeWorkspaceWrites,
             frozenManifest.Tools,
-            frozenManifest.ManifestHash);
+            frozenManifest.ManifestHash,
+            policy.PermissionMode,
+            ReadFrozenDispatchRoster(frozen.Content),
+            authorization.AllowedDispatchTargets,
+            executionTarget?.RootPath);
+    }
+
+    /// <summary>Reads the frozen dispatch roster (ids + responsibility text); null when absent.</summary>
+    internal static IReadOnlyList<DispatchRosterEntry>? ReadFrozenDispatchRoster(string content)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(content);
+            if (!TryGetProperty(document.RootElement, out var roster, "dispatchRoster", "dispatch_roster")
+                || roster.ValueKind != JsonValueKind.Array)
+                return null;
+            return roster.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.Object)
+                .Select(item => new DispatchRosterEntry(ReadRootText(item, "id") ?? string.Empty, ReadRootText(item, "description") ?? string.Empty))
+                .Where(item => item.Id.Length > 0)
+                .ToArray();
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     private static bool IsToolAllowed(IReadOnlyList<string> allowedTools, string toolId) =>
@@ -126,26 +187,8 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
             : allowedTools.Any(value => string.Equals(value, "*", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(value, toolId, StringComparison.OrdinalIgnoreCase));
 
-    private static bool IsResourceAllowed(IReadOnlyList<string> resources, string root)
-    {
-        if (resources.Count == 0) return true;
-        foreach (var resource in resources)
-        {
-            if (string.Equals(resource, "workspace", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(resource, "project", StringComparison.OrdinalIgnoreCase)) return true;
-            try
-            {
-                var candidate = Path.GetFullPath(resource);
-                if (string.Equals(candidate, root, StringComparison.OrdinalIgnoreCase)
-                    || candidate.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return true;
-            }
-            catch (Exception) when (resource.Length > 0)
-            {
-                // A malformed resource is simply not an authorization grant.
-            }
-        }
-        return false;
-    }
+    private static bool IsResourceAllowed(IReadOnlyList<string> resources) =>
+        ToolResourceAllowList.IsAllowed(resources);
 
     internal static FrozenToolManifestBinding ReadFrozenToolManifest(string content)
     {
@@ -246,22 +289,29 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
             using var document = JsonDocument.Parse(content);
             // Current frozen bodies use JsonSerializerDefaults.Web (camelCase),
             // while imported or older frozen bodies can retain TOML snake_case.
-            // Neither form may turn a first-slice tool call into an approval
-            // bypass, and deny mode must not execute a tool at all.
+            // Deny and unknown modes must not execute a tool at all; passing
+            // this gate never grants an approval by itself.
             var permissionMode = ReadString(document.RootElement, "permissionMode", "permission_mode");
-            if (!string.IsNullOrWhiteSpace(permissionMode)
-                && permissionMode is not ("ask" or "default"))
-            {
-                throw new UnauthorizedAccessException("Frozen run permission mode does not permit tool execution.");
-            }
-            var timeout = ReadInt(document.RootElement, "tools", "defaultTimeoutSeconds", "default_timeout_seconds", 120, 1, 1800);
+            EnsurePermissionModeExecutable(permissionMode);
+            var timeout = ReadInt(document.RootElement, "tools", "defaultTimeoutSeconds", "default_timeout_seconds", 600, 1, 1800);
             var retries = ReadInt(document.RootElement, "scheduling", "workerRetryLimit", "worker_retry_limit", 0, 0, 10);
             var serialize = ReadBoolean(document.RootElement, "tools", "serializeWorkspaceWrites", "serialize_workspace_writes", true);
-            return new FrozenToolPolicy(timeout, retries, serialize);
+            return new FrozenToolPolicy(permissionMode, timeout, retries, serialize);
         }
         catch (JsonException ex)
         {
             throw new InvalidDataException("Frozen run configuration is not valid JSON.", ex);
+        }
+    }
+
+    internal static void EnsurePermissionModeExecutable(string? permissionMode)
+    {
+        var normalized = permissionMode?.Trim().ToLowerInvariant();
+        if (!string.IsNullOrWhiteSpace(normalized)
+            && normalized is not ("ask" or "default" or "auto-approve" or "full-access")
+            && !ApprovalDelegationModes.IsDelegated(normalized))
+        {
+            throw new UnauthorizedAccessException("Frozen run permission mode does not permit tool execution.");
         }
     }
 
@@ -304,7 +354,7 @@ public sealed class ToolInvocationScopeResolver : IToolInvocationScopeResolver
         return fallback;
     }
 
-    private sealed record FrozenToolPolicy(int DefaultTimeoutSeconds, int WorkerRetryLimit, bool SerializeWorkspaceWrites);
+    private sealed record FrozenToolPolicy(string? PermissionMode, int DefaultTimeoutSeconds, int WorkerRetryLimit, bool SerializeWorkspaceWrites);
 
     internal sealed record FrozenToolManifestBinding(
         int ProtocolVersion,

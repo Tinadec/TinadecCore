@@ -71,13 +71,13 @@ public sealed class ChatResolution
     public string? ModelId { get; init; }
     /// <summary>Wire protocol the resolved provider speaks; one of <see cref="ChatProtocols"/>.</summary>
     public string? Protocol { get; init; }
-    /// <summary>Local HTTP endpoint of a CLI runtime (opencode serve); null for HTTP API providers.</summary>
+    /// <summary>Local HTTP endpoint of a CLI runtime that serves over HTTP (<c>opencode serve</c>); null for HTTP API providers and for stdio harness sessions.</summary>
     public string? ServerUrl { get; init; }
-    /// <summary>Bearer token issued by an ACP CLI on startup, when the agent prints one.</summary>
+    /// <summary>Bearer token an HTTP-serving CLI runtime prints on startup, when it issues one. Never used by the stdio ACP channel.</summary>
     public string? Token { get; init; }
-    /// <summary>Absolute path to the CLI executable for <see cref="Acp"/> / <see cref="OpencodeServe"/> protocols.</summary>
+    /// <summary>Absolute path to the harness executable; required by every process-backed protocol (<see cref="Acp"/>, <see cref="HeadlessCli"/>, <see cref="Tui"/>) in place of an endpoint URL.</summary>
     public string? BinaryPath { get; init; }
-    /// <summary>CLI launch arguments (e.g. <c>serve --port 4096</c>, <c>--acp-port 0</c>).</summary>
+    /// <summary>CLI launch arguments, already materialized from the harness catalog's argv template for the selected channel (e.g. <c>serve --port 4096</c>, <c>--acp</c>).</summary>
     public string? LaunchArgs { get; init; }
     public string? HomePath { get; init; }
     public string? Error { get; init; }
@@ -87,11 +87,16 @@ public sealed class ChatResolution
     public Guid? RouteVersionId { get; init; }
     public int CandidatePosition { get; init; }
     public string? StrategySource { get; init; }
+    public ModelParameters? Parameters { get; init; }
 }
 
 /// <summary>
 /// Canonical chat wire-protocol identifiers carried by <see cref="ChatResolution.Protocol"/>
-/// and stored in provider configuration JSON (<c>protocol</c> key).
+/// and stored in provider configuration JSON (<c>protocol</c> key). This axis answers <em>which
+/// dialect</em> is spoken; it is not <em>how the process is reached</em>
+/// (<see cref="AgentChannels"/>) and not <em>local process or HTTP API</em>
+/// (<c>connection_kind</c>). Resolve a harness's protocol through
+/// <see cref="HarnessCatalog.ResolveProtocol"/>, never from its driver name alone.
 /// </summary>
 public static class ChatProtocols
 {
@@ -105,8 +110,18 @@ public static class ChatProtocols
     public const string AnthropicMessages = "anthropic-messages";
 
     /// <summary>
-    /// Agent Client Protocol (ACP): the client hosts a CLI subprocess (claude/codex/cursor-agent)
-    /// that exposes a JSON-RPC 2.0 + SSE server on a local port; chat runs through that process.
+    /// Agent Client Protocol: a persistent JSON-RPC 2.0 session carried over the harness
+    /// subprocess's stdio, one frame per line (NDJSON). Two details the wire format fixes and the
+    /// serializer has to honor: field names are <em>camelCase</em> (<c>sessionId</c>,
+    /// <c>sessionUpdate</c>, <c>stopReason</c>) and <c>protocolVersion</c> is the <em>integer</em>
+    /// 1 — neither matches Core's snake_case API-boundary convention, so ACP needs its own
+    /// serialization context rather than a reused one.
+    /// <para>
+    /// The client declares <c>fs.readTextFile</c>, <c>fs.writeTextFile</c> and <c>terminal</c>
+    /// capabilities as false, which is not a restriction: it means Core does not act as the
+    /// harness's file or terminal proxy. The harness still reads and writes its session working
+    /// directory with its own tools, so the session's <c>cwd</c> is what governs its blast radius.
+    /// </para>
     /// </summary>
     public const string Acp = "acp";
 
@@ -115,6 +130,18 @@ public static class ChatProtocols
     /// (POST /session, POST /session/{id}/message, GET /session/{id}/event).
     /// </summary>
     public const string OpencodeServe = "opencode-serve";
+
+    /// <summary>
+    /// Headless CLI protocol: the harness is invoked once with the prompt on argv or stdin, emits
+    /// its vendor JSON envelope on stdout, and exits.
+    /// </summary>
+    public const string HeadlessCli = "headless-cli";
+
+    /// <summary>
+    /// TUI protocol: a full-screen harness hosted in a real PTY. Core submits one prompt, projects
+    /// the settled visible transcript into an assistant answer, then tears down the one-shot terminal.
+    /// </summary>
+    public const string Tui = "tui";
 
     /// <summary>
     /// Normalizes a stored protocol value; blank or unknown values fall back to
@@ -126,16 +153,82 @@ public static class ChatProtocols
         AnthropicMessages => AnthropicMessages,
         Acp => Acp,
         OpencodeServe => OpencodeServe,
+        HeadlessCli => HeadlessCli,
+        Tui => Tui,
         _ => OpenAiChat
     };
 
-    /// <summary>Infers the protocol from a provider driver name when no explicit protocol is configured.</summary>
+    /// <summary>
+    /// Infers a protocol from a provider driver name when no explicit protocol and no harness
+    /// channel are configured. Covers HTTP API drivers <em>only</em>.
+    /// <para>
+    /// A harness's protocol is a property of a (harness, channel) pair, so it comes from
+    /// <see cref="HarnessCatalog.ProtocolFor"/>. The removed rows here mapped <c>claude-cli</c>,
+    /// <c>codex-cli</c> and <c>cursor-acp</c> all to <see cref="Acp"/>; none of those binaries
+    /// offered an ACP endpoint, and the driver name encoding a channel
+    /// (<c>-cli</c>, <c>-acp</c>) was the same category error this narrowing ends.
+    /// </para>
+    /// <para>
+    /// <c>claude</c> below is the Anthropic HTTP API driver and stays distinct from the
+    /// <c>claude-code</c> catalog harness id that names the vendor's CLI.
+    /// </para>
+    /// </summary>
     public static string InferFromDriver(string? driver) => driver?.Trim().ToLowerInvariant() switch
     {
         "anthropic" or "claude" => AnthropicMessages,
         "openai-responses" => OpenAiResponses,
-        "claude-cli" or "codex-cli" or "cursor-acp" => Acp,
-        "opencode" => OpencodeServe,
         _ => OpenAiChat
     };
+
+    /// <summary>
+    /// True when Core reaches the peer by spawning a process and talking to its stdio, so the
+    /// resolution needs a <c>binary_path</c> and has no endpoint URL. <see cref="OpencodeServe"/> is
+    /// excluded on purpose: that harness is reached over HTTP, which is why it kept working when the
+    /// invented stdio-over-HTTP dialect was removed.
+    /// </summary>
+    public static bool IsProcessTransport(string? protocol) => Normalize(protocol) switch
+    {
+        Acp or HeadlessCli or Tui => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// True when the peer chooses which model answers, so Core must not require a model id in the
+    /// provider configuration. Covers every local-agent protocol, both transports.
+    /// </summary>
+    public static bool IsModelChosenByHarness(string? protocol) => Normalize(protocol) switch
+    {
+        Acp or HeadlessCli or Tui or OpencodeServe => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// The gap that stops Core from driving a local channel today, or <c>null</c> when this build can
+    /// drive it. One owner for the wording, because discovery offers the channel, the chat factory
+    /// refuses it, and the model center explains the refusal — three places that read as three
+    /// different answers if each invents its own sentence.
+    /// <para>
+    /// <see cref="HeadlessCli"/> and <see cref="Tui"/> have no entry here because chat clients now
+    /// exist. Headless CLI is still not drivable for a harness whose answer frame this build has
+    /// never captured — that verdict is
+    /// per-harness and lives in <see cref="HarnessCatalog.HasVerifiedHeadlessEnvelope"/>, since the
+    /// envelope vocabulary belongs to the vendor, not to the protocol.
+    /// </para>
+    /// </summary>
+    public static string? HarnessClientGap(string? protocol) => Normalize(protocol) switch
+    {
+        _ => null
+    };
+
+    /// <summary>
+    /// True when this build can start a provider and carry a turn over that protocol: a harness
+    /// protocol with a chat client, or an HTTP API. Discovery answers with it, so a channel that is
+    /// configured but not implemented cannot be presented as a button that works.
+    /// </summary>
+    public static bool IsDrivable(string? protocol)
+    {
+        var normalized = Normalize(protocol);
+        return HarnessClientGap(normalized) is null
+            && normalized switch { Acp or OpencodeServe or HeadlessCli or Tui => true, _ => false };
+    }
 }

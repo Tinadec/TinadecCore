@@ -32,7 +32,15 @@ public sealed record FrozenPromptAssemblyRequest(
     Guid? PromptVersionId = null,
     string? PromptVersionContentHash = null,
     string? PromptGraphJson = null,
-    bool IncludeLiveFragments = false);
+    bool IncludeLiveFragments = false)
+{
+    /// <summary>
+    /// The run's frozen workspace, when one is bound. It is prompt input, not a
+    /// live lookup: the assembler renders the frozen root, git facts, listing and
+    /// path contract, and never asks the store for a current root.
+    /// </summary>
+    public FrozenWorkspaceBinding? Workspace { get; init; }
+}
 
 public sealed class PromptAssemblyResult
 {

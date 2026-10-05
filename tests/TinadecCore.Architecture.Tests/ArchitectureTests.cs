@@ -19,6 +19,7 @@ public sealed class ArchitectureTests
     private static readonly Assembly LoopGuardAssembly = typeof(LoopGuard.LoopGuardModuleRegistrar).Assembly;
     private static readonly Assembly LifecycleAssembly = typeof(Lifecycle.LifecycleModuleRegistrar).Assembly;
     private static readonly Assembly GovernanceAssembly = typeof(Governance.GovernanceModuleRegistrar).Assembly;
+    private static readonly Assembly TinaChatAssembly = typeof(TinaChat.TinaChatModuleRegistrar).Assembly;
     private static readonly Assembly RuntimeAssembly = typeof(Runtime.TinadecCoreBuilder).Assembly;
     private static readonly Assembly AspNetCoreAssembly = typeof(TinadecCore.AspNetCore.TinadecCoreHttpExtensions).Assembly;
     private static readonly Assembly ApiAssembly = typeof(Program).Assembly;
@@ -28,7 +29,7 @@ public sealed class ArchitectureTests
         ContractsAssembly, AbstractionsAssembly, PersistenceAssembly, VectorStoreAssembly, StrategiesAssembly,
         DmaEAAssembly, ModelsAssembly, ContextAssembly, PromptsAssembly,
         MemoryAssembly, SkillsAssembly, LoopGuardAssembly, LifecycleAssembly, GovernanceAssembly,
-        RuntimeAssembly, AspNetCoreAssembly, ApiAssembly
+        TinaChatAssembly, RuntimeAssembly, AspNetCoreAssembly, ApiAssembly
     ];
 
     // TinadecCore.AspNetCore is intentionally excluded: it is the second
@@ -38,7 +39,7 @@ public sealed class ArchitectureTests
         ContractsAssembly, AbstractionsAssembly, PersistenceAssembly, VectorStoreAssembly, StrategiesAssembly,
         DmaEAAssembly, ModelsAssembly, ContextAssembly, PromptsAssembly,
         MemoryAssembly, SkillsAssembly, LoopGuardAssembly, LifecycleAssembly, GovernanceAssembly,
-        RuntimeAssembly
+        TinaChatAssembly, RuntimeAssembly
     ];
 
     [Fact]
@@ -90,6 +91,7 @@ public sealed class ArchitectureTests
             ("LoopGuard", LoopGuardAssembly),
             ("Lifecycle", LifecycleAssembly),
             ("Governance", GovernanceAssembly),
+            ("TinaChat", TinaChatAssembly),
         };
 
         foreach (var (name, asm) in businessModules)
@@ -150,12 +152,37 @@ public sealed class ArchitectureTests
         var mafReferences = DmaEAAssembly.GetReferencedAssemblies()
             .Where(reference => reference.Name?.StartsWith("Microsoft.Agents.AI", StringComparison.Ordinal) == true)
             .ToDictionary(reference => reference.Name!, reference => reference.Version!);
-        Assert.Equal(4, mafReferences.Count);
+        Assert.Equal(3, mafReferences.Count);
         Assert.All(mafReferences.Values, version =>
         {
             Assert.Equal(1, version.Major);
             Assert.Equal(18, version.Minor);
         });
+    }
+
+    /// <summary>
+    /// Assembly references only prove that DmaEA links MAF. This proves the agent surface is
+    /// used by exactly one type: every governance turn goes through
+    /// <c>Maf18RuntimeAdapter.RunGovernanceTurnAsync</c> and gets a Tinadec-owned result back,
+    /// so no caller holds an <c>OpenTelemetryAgent</c> or calls MAF's <c>RunAsync</c>. A MAF
+    /// upgrade then lands in that one file instead of at the nine governance call sites.
+    /// </summary>
+    [Fact]
+    public void MafTypesAreUsedOnlyInsideTheDmaeaAdapter()
+    {
+        var result = Types.InAssembly(DmaEAAssembly)
+            .Should().NotHaveDependencyOn("Microsoft.Agents.AI")
+            .GetResult();
+
+        // Only the adapter may touch MAF — including the compiler-generated state machines
+        // nested inside it, which carry the awaited agent across the turn. Matching on the
+        // full-name prefix keeps this true whichever name form NetArchTest reports.
+        var failing = result.FailingTypeNames ?? Enumerable.Empty<string>();
+        var outsideAdapter = failing
+            .Where(name => !name.StartsWith("TinadecCore.DmaEA.Maf18RuntimeAdapter", StringComparison.Ordinal))
+            .ToArray();
+
+        Assert.Empty(outsideAdapter);
     }
 
     [Fact]

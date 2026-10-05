@@ -29,7 +29,7 @@ public sealed class FrozenWorkerSelectionTests
     [Theory]
     [InlineData("worker.code", "tool.code", "write_file")]
     [InlineData("worker.document", "tool.document", "read_file")]
-    [InlineData("worker.data", "tool.data", "shell.execute")]
+    [InlineData("worker.data", "tool.data", "shell")]
     [InlineData("worker.browser", "tool.browser", "browser.fetch")]
     [InlineData("worker.file", "tool.file", "read_file")]
     [InlineData("worker.general", "task.execute", null)]
@@ -74,6 +74,41 @@ public sealed class FrozenWorkerSelectionTests
     }
 
     [Fact]
+    public void SelectWorker_FallsBackToAvailableWorkerWhenRosterHasNoGeneral()
+    {
+        // 问答/规划/规范 模式的执行层是精简 worker 子集、不含 worker.general。
+        // 无要求任务（如通用提问）此前会 fail-closed 抛 WorkerUnavailableException，
+        // 现应回退到在册 worker，避免整段对话不可用。
+        var browser = Agent("worker.browser", "execution", "task_executor", ["tool.search", "tool.browser"], ["browser.fetch"], 4);
+
+        var selection = FullDuplexRunEngine.SelectWorker(Configuration([browser]), Task());
+
+        Assert.Equal("worker.browser", selection.Agent.Id);
+        Assert.Equal("general_unavailable_fallback", selection.Reason);
+    }
+
+    /// <summary>
+    /// An open-ended task declares nothing to narrow against, so the old "fewest extra
+    /// tools" tie-break handed it to the NARROWEST worker. That is how a real request
+    /// to write a file landed on a read-only executor which then reported it had no
+    /// way to do the job while the run closed as completed. A task that DOES declare
+    /// requirements keeps least-privilege selection.
+    /// </summary>
+    [Fact]
+    public void SelectWorker_OpenEndedTask_PrefersTheWidestWorker()
+    {
+        var narrow = Agent("worker.read", "execution", "task_executor", ["tool.read"], ["read_file"], 1);
+        var wide = Agent("worker.eng", "execution", "task_executor", ["tool.code", "tool.file"], ["read_file", "write_file", "shell"], 2);
+
+        var openEnded = FullDuplexRunEngine.SelectWorker(Configuration([narrow, wide]), Task());
+        Assert.Equal("worker.eng", openEnded.Agent.Id);
+
+        // Declared requirements: the narrow worker covers them exactly and wins.
+        var declared = FullDuplexRunEngine.SelectWorker(Configuration([narrow, wide]), Task(tools: ["read_file"]));
+        Assert.Equal("worker.read", declared.Agent.Id);
+    }
+
+    [Fact]
     public void SelectWorker_FailsClosedForUnsupportedCapabilityOrTool()
     {
         var capability = Assert.Throws<WorkerUnavailableException>(() =>
@@ -112,18 +147,17 @@ public sealed class FrozenWorkerSelectionTests
         var planner = Agent("task_planner", "execution", "execution_coordinator", ["task.plan", "agent.create_temporary"], ["*"], 0);
         var code = Agent("worker.code", "execution", "task_executor", ["tool.code", "tool.file"], ["read_file", "write_file"], 1);
         var document = Agent("worker.document", "execution", "task_executor", ["tool.document"], ["read_file", "write_file"], 2);
-        var data = Agent("worker.data", "execution", "task_executor", ["tool.data"], ["read_file", "shell.execute"], 3);
+        var data = Agent("worker.data", "execution", "task_executor", ["tool.data"], ["read_file", "shell"], 3);
         var browser = Agent("worker.browser", "execution", "task_executor", ["tool.search", "tool.browser"], ["browser.search", "browser.fetch", "mcp_search", "mcp_invoke"], 4);
         var file = Agent("worker.file", "execution", "task_executor", ["tool.file"], ["read_file", "write_file"], 5);
         var general = Agent("worker.general", "execution", "task_executor", ["task.execute"], ["*"], 6);
         var git = Agent("worker.git", "execution", "git_specialist", ["tool.git"], ["git_status", "git_diff", "git_commit"], 7);
         workers ??= [code, document, data, browser, file, general, git];
         return new FrozenRunConfigurationV1(
-            "frozen-run-configuration/v1",
+            "frozen-run-configuration/v3",
             "baseline",
             1,
-            "space",
-            "auto",
+            Guid.Parse("00000000-0000-0000-0000-0000000000aa"),
             "mode:test:1",
             "ask",
             new SpawnPolicy(2, 8, 4),
@@ -134,12 +168,12 @@ public sealed class FrozenWorkerSelectionTests
             new ToolRuntimePolicy("tinadec-tools", true, true, 120, 4),
             [meeting, supervisor],
             [planner, .. workers],
-            null,
-            [])
+            [],
+            "")
         {
             ToolManifestProtocolVersion = 2,
             ToolManifest = [
-                Tool("read_file"), Tool("write_file"), Tool("shell.execute"), Tool("mcp_invoke"),
+                Tool("read_file"), Tool("write_file"), Tool("shell"), Tool("mcp_invoke"),
                 Tool("browser.search"), Tool("browser.fetch"), Tool("mcp_search"),
                 Tool("git_status"), Tool("git_diff"), Tool("git_commit")
             ]

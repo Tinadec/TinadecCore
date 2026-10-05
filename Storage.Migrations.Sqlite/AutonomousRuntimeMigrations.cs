@@ -36,10 +36,8 @@ public sealed class AutonomousLifecycle : Migration
         alter table runs add column context_revision integer not null default 0;
         alter table runs add column configuration_version integer not null default 0;
         alter table runs add column configuration_hash text not null default '';
-        alter table runs add column application_mode text not null default 'conversation';
-        alter table runs add column agent_mode text not null default 'auto';
         alter table runs add column permission_mode text not null default 'default';
-        alter table runs add column runtime_profile_id text not null default 'conversation.auto';
+        alter table runs add column runtime_profile_id text not null default '';
         create table if not exists tool_executions (id text primary key, tenant_id text not null, workspace_id text not null, project_id text null, session_id text not null, run_id text not null, task_id text not null, agent_instance_id text not null, approval_id text null, tool_id text not null, risk text not null, requires_approval integer not null, status text not null, parameters_hash text not null, parameters_reference text not null, parameters_length integer not null, result_reference text null, result_hash text null, result_length integer null, attempt integer not null, created_at text not null, updated_at text not null, completed_at text null);
         create index if not exists ix_tool_executions_run_created on tool_executions(tenant_id, workspace_id, run_id, created_at);
         """);
@@ -53,7 +51,6 @@ public sealed class AutonomousAgentControl : Migration
     protected override void Up(MigrationBuilder m) => m.Sql("""
         create table if not exists agent_instances (id text primary key, tenant_id text not null, workspace_id text not null, session_id text not null, run_id text not null, task_node_id text null, parent_instance_id text null, profile_id text null, created_by_profile_id text null, layer text not null, role text not null, generation_depth integer not null, generated integer not null, status text not null, definition_reference text not null, definition_hash text not null, definition_length integer not null, created_at text not null, updated_at text not null, released_at text null);
         create table if not exists agent_candidates (id text primary key, tenant_id text not null, workspace_id text not null, project_id text null, source_run_id text not null, source_instance_id text not null, generated_by_instance_id text not null, name text not null, layer text not null, agent_type text not null, status text not null, confidence_score real not null, proposal_reference text not null, proposal_hash text not null, proposal_length integer not null, promoted_agent_id text null, decision_reason text null, created_by_principal_id text not null, decided_by_principal_id text null, created_at text not null, updated_at text not null);
-        create table if not exists runtime_profile_overrides (id text primary key, tenant_id text not null, workspace_id text not null, profile_id text not null, version integer not null, enabled integer not null, content_reference text not null, content_hash text not null, content_length integer not null, created_by_principal_id text not null, created_at text not null);
         """);
     protected override void Down(MigrationBuilder m) { }
 }

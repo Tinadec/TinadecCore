@@ -33,7 +33,9 @@ dotnet publish TinadecCore/Api/TinadecCore.Api.csproj -c Release --no-restore -o
 dotnet artifacts/tinadec-core-api/TinadecCore.Api.dll --urls http://127.0.0.1:48731
 ```
 
-SQLite 适合本地部署；自托管云部署通过配置 PostgreSQL、ContentStore 和外部身份适配器完成。当前仓库尚未承诺容器镜像、NuGet feed、OIDC 适配器或生成的 TypeScript/.NET Client SDK，这些仍属于 Phase 1 后续交付。
+SQLite 适合本地部署；自托管云部署通过配置 PostgreSQL、ContentStore 和外部身份适配器完成。
+
+容器切片（A4）：`TinadecCore/Api/Dockerfile` 以 sdk:10.0 构建、aspnet:10.0 运行，`/data` 卷统一承载 SQLite 数据库与 Core 文件存储（sessions/tasks/events/artifacts/vectors），监听 48731。`core-pack.yml` 的 `docker-image` job 只构建不推送——真实 registry 推送待容器仓库选定后接入。NuGet 发布管线已备好（`publish` job + `NUGET_API_KEY`）；OIDC 外部身份适配器与云端多租户调度仍属延后项。
 
 ## 发布
 
@@ -48,7 +50,7 @@ SQLite 适合本地部署；自托管云部署通过配置 PostgreSQL、ContentS
 
 - `TinadecTools.Generators` 继续是 TinadecTool 的 Analyzer/Source Generator，不参与 Core 打包，也不成为运行时依赖。
 - Gateway 只代理 Core API；它不读取 Core 数据库，也不负责 Core 包或工具授权。
-- `OfficeAgentPack` 是 TinadecOffice/TinadecApp 的构建产物，不进入 Core NuGet 或 `TinadecCore.Api` publish 目录。Core 包只携带通用 Agent Pack 契约、安装服务、持久化迁移和无 App 专业知识的 TOML fallback。
-- Desktop 与 Web 从同一 renderer 静态导入 `apps/desktop/src/agentPacks/OfficeAgentPack/manifest.json`，生产构建必须包含 Pack ID 和固定 digest；不得在运行时依赖机器路径读取 manifest。
+- `GraphSeedPack`（`tinadec.graph.seed-pack`）是 TinadecOffice/TinadecApp 的构建产物，不进入 Core NuGet 或 `TinadecCore.Api` publish 目录。Core 包只携带通用 Agent Pack 契约、安装服务、持久化迁移和无 App 专业知识的 TOML fallback。
+- Desktop 与 Web 从同一 renderer 静态导入 `apps/desktop/src/agentPacks/GraphSeedPack/manifest.json`，生产构建必须包含 Pack ID 和固定 digest；不得在运行时依赖机器路径读取 manifest。旧 `OfficeAgentPack` 已退役并从桌面发布物删除；Core 测试不再读取桌面产物，改用自包含夹具 `TinadecCore/tests/TinadecCore.Api.Tests/Fixtures/agent-pack-lifecycle.manifest.json`（包生命周期）与内嵌 roster（工具链）。
 - App 连接后把 bundled manifest 经公开 `/api/v1/agent-packs/*` 契约提交到当前工作区；不得通过复制文件到 Core 安装目录或直接写 Core 数据库完成“安装”。SQLite/PostgreSQL 的 Pack 表迁移属于 Core Runtime/API 交付物。
 - MAF `1.18.0` 的版本兼容性由 `DmaEA/Maf18RuntimeAdapter.cs` 和兼容测试门禁；升级不得改变 Contracts 包、事件或配置契约。

@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using TinadecCore.Abstractions.Ports;
 using TinadecCore.Governance;
 
@@ -302,6 +303,36 @@ public sealed class GovernanceServiceTests
         Assert.False(await harness.Service.RevokeLeaseAsync(lease.Id, "Cross-tenant attempt."));
     }
 
+    [Fact]
+    public async Task RiskVocabulary_ElevatedIsAccepted_UnknownRiskFailsClosed()
+    {
+        await using var harness = await GovernanceHarness.CreateAsync();
+        harness.Context.Boundaries = [new("hard_policy", [AllowWrite])];
+        var approverAgent = Guid.NewGuid();
+        var approverVersion = Guid.NewGuid();
+        harness.Context.AgentVersions[approverAgent] = approverVersion;
+
+        // elevated joined the formal vocabulary: it is accepted on both the
+        // delegation ceiling and the request, and an elevated-ceiling delegation
+        // may decide an elevated-risk request (medium < elevated < high).
+        var delegation = await harness.Service.CreateApprovalDelegationAsync(new CreateApprovalDelegationCommand(
+            approverVersion, approverAgent, [AllowWrite], "elevated", 10, 2,
+            harness.Time.GetUtcNow().AddHours(1)));
+        Assert.Equal("elevated", delegation.MaxRisk);
+
+        var pending = await harness.Service.RequestPermissionAsync(Request(
+            Guid.NewGuid(), "elevated-request", Guid.NewGuid(), "elevated", 1));
+        var resolved = await harness.Service.DecidePermissionAsync(new PermissionDecisionCommand(
+            pending.Request.Id, true, approverAgent, delegation.Id, "elevated within an elevated ceiling."));
+        Assert.Equal(PermissionRequestStatuses.Granted, resolved.Request.Status);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => harness.Service.CreateApprovalDelegationAsync(new CreateApprovalDelegationCommand(
+            approverVersion, approverAgent, [AllowWrite], "bogus", 10, 2,
+            harness.Time.GetUtcNow().AddHours(1))));
+        await Assert.ThrowsAsync<ArgumentException>(() => harness.Service.RequestPermissionAsync(
+            Request(Guid.NewGuid(), "bogus-risk", risk: "bogus")));
+    }
+
     private static PermissionRequestCommand Request(
         Guid subject,
         string idempotencyKey,
@@ -344,7 +375,7 @@ internal sealed class GovernanceHarness : IAsyncDisposable
     public TestAuthorizationContextResolver Context { get; }
     public MutableTimeProvider Time { get; }
 
-    public static async Task<GovernanceHarness> CreateAsync()
+    public static async Task<GovernanceHarness> CreateAsync(AutoApproveOptions? autoApprove = null, IApprovalRules? approvalRules = null)
     {
         var databasePath = Path.Combine(Path.GetTempPath(), $"tinadec-governance-{Guid.NewGuid():N}.db");
         var options = new DbContextOptionsBuilder<GovernanceDbContext>()
@@ -359,7 +390,9 @@ internal sealed class GovernanceHarness : IAsyncDisposable
         };
         var context = new TestAuthorizationContextResolver();
         var time = new MutableTimeProvider(new DateTimeOffset(2026, 8, 22, 0, 0, 0, TimeSpan.Zero));
-        return new GovernanceHarness(databasePath, new GovernanceService(factory, tenant, context, time), tenant, context, time);
+        var service = new GovernanceService(factory, tenant, context, time,
+            autoApproveOptions: Options.Create(autoApprove ?? new AutoApproveOptions()), approvalRules: approvalRules);
+        return new GovernanceHarness(databasePath, service, tenant, context, time);
     }
 
     public ValueTask DisposeAsync()

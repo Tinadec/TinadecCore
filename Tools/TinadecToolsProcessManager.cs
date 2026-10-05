@@ -4,6 +4,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using TinadecCore.Abstractions;
 using TinadecCore.Abstractions.Ports;
 using TinadecCore.Contracts.Dtos;
 
@@ -31,6 +32,7 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
     private readonly TimeSpan _startupTimeout;
     private readonly TimeSpan _defaultTimeout;
     private readonly string? _defaultWorkspaceRoot;
+    private readonly string? _additionalReadRoots;
 
     private readonly object _stateLock = new();
     private readonly Dictionary<string, ManagedProcess> _processes = new(StringComparer.OrdinalIgnoreCase);
@@ -51,6 +53,7 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
         _startupTimeout = TimeSpan.FromSeconds(Double(configuration, "TinadecTools:StartupTimeoutSeconds", 30));
         _defaultTimeout = TimeSpan.FromSeconds(Double(configuration, "TinadecTools:DefaultTimeoutSeconds", 120));
         _defaultWorkspaceRoot = configuration["TinadecTools:DefaultWorkspaceRoot"];
+        _additionalReadRoots = configuration[ToolHostEnvironment.AdditionalReadRootsConfigurationKey];
     }
 
     /// <summary>
@@ -87,11 +90,33 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
         return await process.ManifestTask.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<ToolWireResponseDto> CallAsync(
+    public Task<ToolWireResponseDto> CallAsync(
         string workspaceRoot,
         ToolWireRequestDto request,
         TimeSpan? timeout = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        CallAsync(workspaceRoot, request, timeout, observer: null, cancellationToken);
+
+    public Task<ToolWireResponseDto> CallStreamingAsync(
+        string workspaceRoot,
+        ToolWireRequestDto request,
+        TimeSpan? timeout,
+        Action<ToolWireEventDto>? onEvent,
+        CancellationToken cancellationToken = default) =>
+        CallAsync(workspaceRoot, request, timeout, onEvent, cancellationToken);
+
+    /// <summary>
+    /// Raised for wire events that carry no in-flight call id (broadcast), e.g. the
+    /// exit of a long-lived terminal session. Subscribers must be exception-safe.
+    /// </summary>
+    public event Action<ToolWireEventDto>? WireEventBroadcast;
+
+    private async Task<ToolWireResponseDto> CallAsync(
+        string workspaceRoot,
+        ToolWireRequestDto request,
+        TimeSpan? timeout,
+        Action<ToolWireEventDto>? observer,
+        CancellationToken cancellationToken)
     {
         var root = ResolveRoot(workspaceRoot);
         if (_executablePath is null)
@@ -123,7 +148,7 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
             Params = request.Params
         };
 
-        var pending = process.RegisterPending(callId);
+        var pending = process.RegisterPending(callId, observer);
         var line = JsonSerializer.Serialize(wire);
         var effectiveTimeout = timeout ?? _defaultTimeout;
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -233,8 +258,16 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
             CreateNoWindow = true
         };
 
+        // The child is scoped to its working directory as the single writable root;
+        // extra readable roots travel as an environment variable the tool-side
+        // resolver reads at startup.
+        if (!string.IsNullOrWhiteSpace(_additionalReadRoots))
+        {
+            startInfo.Environment[ToolHostEnvironment.AdditionalReadRootsVariable] = _additionalReadRoots;
+        }
+
         var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Failed to start the TinadecTools process.");
-        var managed = new ManagedProcess(process, root, _logger);
+        var managed = new ManagedProcess(process, root, _logger, RaiseBroadcast);
 
         // Publish the unique process before beginning its handshake. The handshake calls
         // this exact instance directly; it must never re-enter GetOrStart for the root.
@@ -287,7 +320,7 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
 
     private void RemoveFailedProcess(ManagedProcess process, Exception exception)
     {
-        _logger.LogWarning(exception, "TinadecTools manifest handshake failed for workspace root {Root}", process.Root);
+        _logger.TryLogWarning(exception, "TinadecTools manifest handshake failed for workspace root {Root}", process.Root);
         lock (_stateLock)
         {
             if (_processes.TryGetValue(process.Root, out var current) && ReferenceEquals(current, process))
@@ -324,6 +357,14 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
                 if (line is null) break;
                 if (line.Length == 0) continue;
 
+                // Unsolicited notifications are distinguished from responses by
+                // their "kind" marker; they must never complete a pending call.
+                if (TryParseWireEvent(line, out var wireEvent))
+                {
+                    managed.RaiseEvent(wireEvent!);
+                    continue;
+                }
+
                 ToolWireResponseDto? response;
                 try
                 {
@@ -349,6 +390,65 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
         finally
         {
             managed.FailPending("process_exit", "The TinadecTools process exited before responding.");
+        }
+    }
+
+    /// <summary>
+    /// Detects a protocol v2 notification line. Responses carry no "kind" property,
+    /// so the marker is unambiguous and cannot be spoofed by tool results.
+    /// </summary>
+    private static bool TryParseWireEvent(string line, out ToolWireEventDto? wireEvent)
+    {
+        wireEvent = null;
+        try
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object
+                || !root.TryGetProperty("kind", out var kind)
+                || kind.ValueKind != JsonValueKind.String
+                || !string.Equals(kind.GetString(), "event", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            long callId = 0;
+            if (root.TryGetProperty("call_id", out var callIdElement)
+                && callIdElement.ValueKind == JsonValueKind.Number)
+            {
+                callId = callIdElement.TryGetInt64(out var parsed) ? parsed : 0;
+            }
+
+            wireEvent = new ToolWireEventDto
+            {
+                CallId = callId,
+                Event = root.TryGetProperty("event", out var name) && name.ValueKind == JsonValueKind.String
+                    ? name.GetString() ?? string.Empty
+                    : string.Empty,
+                Payload = root.TryGetProperty("payload", out var payload) ? payload.Clone() : null
+            };
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private void RaiseBroadcast(ToolWireEventDto wireEvent)
+    {
+        var handler = WireEventBroadcast;
+        if (handler is null) return;
+        foreach (var subscriber in handler.GetInvocationList().OfType<Action<ToolWireEventDto>>())
+        {
+            try
+            {
+                subscriber(wireEvent);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Tool wire event broadcast subscriber failed for {Event}", wireEvent.Event);
+            }
         }
     }
 
@@ -395,13 +495,16 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
     private sealed class ManagedProcess : IDisposable
     {
         private readonly ILogger _logger;
+        private readonly Action<ToolWireEventDto> _broadcast;
         private readonly Dictionary<long, TaskCompletionSource<ToolWireResponseDto>> _pending = new();
+        private readonly Dictionary<long, Action<ToolWireEventDto>> _observers = new();
 
-        public ManagedProcess(Process process, string root, ILogger logger)
+        public ManagedProcess(Process process, string root, ILogger logger, Action<ToolWireEventDto> broadcast)
         {
             Process = process;
             Root = root;
             _logger = logger;
+            _broadcast = broadcast;
         }
 
         public Process Process { get; }
@@ -409,14 +512,55 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
         public StreamWriter StandardInput => Process.StandardInput;
         public Task<ToolManifestDto> ManifestTask { get; set; } = null!;
 
-        public TaskCompletionSource<ToolWireResponseDto> RegisterPending(long callId)
+        public TaskCompletionSource<ToolWireResponseDto> RegisterPending(
+            long callId,
+            Action<ToolWireEventDto>? observer = null)
         {
             var tcs = new TaskCompletionSource<ToolWireResponseDto>(TaskCreationOptions.RunContinuationsAsynchronously);
             lock (_pending)
             {
                 _pending[callId] = tcs;
+                if (observer is not null) _observers[callId] = observer;
             }
             return tcs;
+        }
+
+        /// <summary>
+        /// Routes an unsolicited wire event. Events tied to a live call go to that
+        /// call's observer; the rest are broadcast (long-lived session lifecycle).
+        /// </summary>
+        public void RaiseEvent(ToolWireEventDto wireEvent)
+        {
+            Action<ToolWireEventDto>? observer = null;
+            lock (_pending)
+            {
+                if (wireEvent.CallId > 0 && _observers.TryGetValue(wireEvent.CallId, out var found))
+                {
+                    observer = found;
+                }
+            }
+
+            if (observer is not null)
+            {
+                try
+                {
+                    observer(wireEvent);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Tool wire event observer failed for {Event}", wireEvent.Event);
+                }
+                return;
+            }
+
+            try
+            {
+                _broadcast(wireEvent);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Tool wire event broadcast failed for {Event}", wireEvent.Event);
+            }
         }
 
         public bool CompletePending(long callId, ToolWireResponseDto response)
@@ -425,6 +569,7 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
             lock (_pending)
             {
                 if (!_pending.Remove(callId, out tcs)) return false;
+                _observers.Remove(callId);
             }
             return tcs!.TrySetResult(response);
         }
@@ -434,6 +579,7 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
             lock (_pending)
             {
                 _pending.Remove(callId);
+                _observers.Remove(callId);
             }
         }
 
@@ -444,6 +590,7 @@ public sealed class TinadecToolsProcessManager : IToolProcessManager, IHostedSer
             {
                 waiting = _pending.Values.ToList();
                 _pending.Clear();
+                _observers.Clear();
             }
             foreach (var tcs in waiting)
             {

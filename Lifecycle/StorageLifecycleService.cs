@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using TinadecCore.Abstractions;
 using TinadecCore.Abstractions.Ports;
 using TinadecCore.Contracts.Events;
 using TinadecCore.Persistence;
@@ -84,14 +85,38 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
             initiatedByPrincipalId = requestedPrincipal;
         }
 
+        Guid? parentRunId = null;
+        Guid? parentTaskId = null;
+        var runKind = string.IsNullOrWhiteSpace(options?.RunKind) ? "root" : options!.RunKind.Trim().ToLowerInvariant();
+        if (runKind is not ("root" or "execution_child"))
+            throw new ArgumentException("RunKind must be root or execution_child.", nameof(options));
+        if (!string.IsNullOrWhiteSpace(options?.ParentRunId))
+        {
+            if (!Guid.TryParse(options.ParentRunId, out var parsedParentRun) || parsedParentRun == Guid.Empty
+                || !Guid.TryParse(options.ParentTaskId, out var parsedParentTask) || parsedParentTask == Guid.Empty)
+                throw new ArgumentException("A child run requires valid parent_run_id and parent_task_id.", nameof(options));
+            var parent = await db.Runs.AsNoTracking().SingleOrDefaultAsync(x => x.Id == parsedParentRun
+                && x.TenantId == session.TenantId && x.WorkspaceId == session.WorkspaceId && x.SessionId == sessionId, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidOperationException("The parent run does not belong to this session boundary.");
+            if (RunStatusMachine.IsTerminal(parent.Status))
+                throw new InvalidOperationException("A terminal run cannot admit a child run.");
+            parentRunId = parsedParentRun;
+            parentTaskId = parsedParentTask;
+            runKind = "execution_child";
+        }
+        else if (runKind != "root")
+        {
+            throw new ArgumentException("An execution_child run requires a parent run.", nameof(options));
+        }
+
         var run = new RunRecord
         {
             Id = Guid.NewGuid(), TenantId = session.TenantId, WorkspaceId = session.WorkspaceId, SessionId = sessionId, TriggerMessageId = triggerMessageId,
+            ParentRunId = parentRunId, ParentTaskId = parentTaskId, RunKind = runKind,
             InitiatedByPrincipalId = initiatedByPrincipalId,
             TurnId = options?.TurnId, ContextRevision = options?.ContextRevision ?? 0, ConfigurationVersion = options?.ConfigurationVersion ?? 0,
-            ConfigurationHash = options?.ConfigurationHash ?? string.Empty, ApplicationMode = options?.ApplicationMode ?? "conversation",
-            AgentMode = options?.AgentMode ?? "auto", PermissionMode = options?.PermissionMode ?? "default",
-            RuntimeProfileId = options?.RuntimeProfileId ?? "conversation.auto", Status = options is null ? "planning" : "planning", CreatedAt = now, UpdatedAt = now
+            ConfigurationHash = options?.ConfigurationHash ?? string.Empty, PermissionMode = options?.PermissionMode ?? "default",
+            RuntimeProfileId = options?.RuntimeProfileId ?? string.Empty, Status = options is null ? "planning" : "planning", CreatedAt = now, UpdatedAt = now
         };
         db.Runs.Add(run);
         db.RunStreamCursors.Add(new RunStreamCursorRecord { RunId = run.Id, NextSequence = 0, UpdatedAt = now });
@@ -158,13 +183,52 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
 
     public async Task CompleteRunAsync(Guid runId, CancellationToken cancellationToken = default)
     {
+        var now = DateTimeOffset.UtcNow;
         await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-        var run = await db.Runs.SingleOrDefaultAsync(x => x.Id == runId, cancellationToken).ConfigureAwait(false);
-        if (run is null) return;
-        run.Status = "completed";
-        run.CompletedAt = DateTimeOffset.UtcNow;
-        run.UpdatedAt = run.CompletedAt.Value;
-        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        // First terminal fact wins at the database boundary. A tracked
+        // read/SaveChanges pair lets cancel/fail/complete all validate the same old
+        // status and then overwrite one another; the conditional update makes the
+        // terminal claim itself atomic across hosts and DbContext instances.
+        await db.Runs
+            .Where(x => x.Id == runId
+                && x.Status != "completed"
+                && x.Status != "failed"
+                && x.Status != "cancelled")
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, "completed")
+                .SetProperty(x => x.CompletedAt, x => x.CompletedAt ?? now)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public async Task<bool> TryClaimRunCompletionAsync(
+        Guid runId,
+        string expectedStatus,
+        string? expectedLeaseOwner,
+        int? expectedRecoveryCount,
+        CancellationToken cancellationToken = default)
+    {
+        var expected = expectedStatus?.Trim().ToLowerInvariant();
+        if (expected is not ("executing" or "reviewing"))
+            throw new ArgumentException("Successful completion may only be claimed from executing or reviewing.", nameof(expectedStatus));
+        var now = DateTimeOffset.UtcNow;
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var claim = db.Runs.Where(x => x.Id == runId
+            && x.CompletedAt == null
+            && x.Status == expected);
+        if (!string.IsNullOrWhiteSpace(expectedLeaseOwner))
+            claim = claim.Where(x => x.LeaseOwner == expectedLeaseOwner);
+        if (expectedRecoveryCount is not null)
+            claim = claim.Where(x => x.RecoveryCount == expectedRecoveryCount.Value);
+        var updated = await claim
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.CompletedAt, now)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+        if (updated == 1) return true;
+        if (!await db.Runs.AsNoTracking().AnyAsync(x => x.Id == runId, cancellationToken).ConfigureAwait(false))
+            throw new KeyNotFoundException("Run was not found.");
+        return false;
     }
 
     public async Task<int> CountActiveRunsAsync(Guid sessionId, CancellationToken cancellationToken = default)
@@ -172,21 +236,161 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
         var session = await _sessions.FindAsync(sessionId, cancellationToken).ConfigureAwait(false);
         if (session is null) return 0;
         await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-        return await db.Runs.CountAsync(x => x.SessionId == sessionId && x.TenantId == session.TenantId && x.WorkspaceId == session.WorkspaceId && x.Status != "completed" && x.Status != "failed" && x.Status != "cancelled", cancellationToken).ConfigureAwait(false);
+        // Runs parked on awaiting_user are waiting for a human decision, not
+        // consuming worker capacity, so they do not count against the session's
+        // active-run admission limit.
+        return await db.Runs.CountAsync(x => x.SessionId == sessionId && x.TenantId == session.TenantId && x.WorkspaceId == session.WorkspaceId && x.Status != "completed" && x.Status != "failed" && x.Status != "cancelled" && x.Status != "awaiting_user", cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task SetRunStatusAsync(Guid runId, string status, string? summary = null, CancellationToken cancellationToken = default)
+    public Task SetRunStatusAsync(
+        Guid runId,
+        string status,
+        string? summary = null,
+        CancellationToken cancellationToken = default) =>
+        SetRunStatusCoreAsync(runId, status, summary, null, null, null, cancellationToken);
+
+    public Task SetRunStatusUnderLeaseAsync(
+        Guid runId,
+        string status,
+        string? summary,
+        string expectedLeaseOwner,
+        int expectedRecoveryCount,
+        CancellationToken cancellationToken = default) =>
+        SetRunStatusCoreAsync(
+            runId,
+            status,
+            summary,
+            null,
+            expectedLeaseOwner,
+            expectedRecoveryCount,
+            cancellationToken);
+
+    public Task SetRunFailedUnderLeaseAsync(
+        Guid runId,
+        string summary,
+        string errorCategory,
+        string expectedLeaseOwner,
+        int expectedRecoveryCount,
+        CancellationToken cancellationToken = default) =>
+        SetRunStatusCoreAsync(
+            runId,
+            "failed",
+            summary,
+            errorCategory,
+            expectedLeaseOwner,
+            expectedRecoveryCount,
+            cancellationToken);
+
+    private async Task SetRunStatusCoreAsync(
+        Guid runId,
+        string status,
+        string? summary,
+        string? terminalErrorCategory,
+        string? expectedLeaseOwner,
+        int? expectedRecoveryCount,
+        CancellationToken cancellationToken)
     {
-        if (!RunStatusMachine.IsKnown(status)) throw new ArgumentException($"Unknown run status '{status}'.", nameof(status));
-        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-        var run = await db.Runs.SingleOrDefaultAsync(x => x.Id == runId, cancellationToken).ConfigureAwait(false);
-        if (run is null) throw new KeyNotFoundException("Run was not found.");
-        if (!RunStatusMachine.CanTransition(run.Status, status)) throw new InvalidOperationException($"Run cannot transition from '{run.Status}' to '{status}'.");
-        run.Status = status;
-        run.Summary = summary ?? run.Summary;
-        run.UpdatedAt = DateTimeOffset.UtcNow;
-        if (RunStatusMachine.IsTerminal(status)) run.CompletedAt = run.UpdatedAt;
-        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(status)) throw new ArgumentException("Run status is required.", nameof(status));
+        var target = status.Trim().ToLowerInvariant();
+        if (!RunStatusMachine.IsKnown(target)) throw new ArgumentException($"Unknown run status '{status}'.", nameof(status));
+
+        // Status is a state machine and therefore needs compare-and-set semantics,
+        // not optimistic intent followed by an unconditional tracked write. Reload
+        // and retry only when another writer changed the observed source state; a
+        // competing terminal winner then fails CanTransition and remains final.
+        for (var attempt = 0; attempt < 16; attempt++)
+        {
+            await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            var current = await db.Runs.AsNoTracking()
+                .Where(x => x.Id == runId)
+                .Select(x => new { x.Status, x.Summary, x.TerminalErrorCategory, x.CompletedAt, x.CheckpointRevision, x.RunKind })
+                .SingleOrDefaultAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (current is null) throw new KeyNotFoundException("Run was not found.");
+            if (current.CompletedAt is not null
+                && !RunStatusMachine.IsTerminal(current.Status)
+                && !string.Equals(target, "completed", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("Run completion has already been claimed and is being durably finalized.");
+            }
+            if (!RunStatusMachine.CanTransition(current.Status, target))
+                throw new InvalidOperationException($"Run cannot transition from '{current.Status}' to '{target}'.");
+
+            var now = DateTimeOffset.UtcNow;
+            var nextSummary = summary ?? current.Summary;
+            var query = db.Runs.Where(x => x.Id == runId
+                && x.Status == current.Status
+                && x.TerminalErrorCategory == current.TerminalErrorCategory
+                && x.CompletedAt == current.CompletedAt
+                && x.CheckpointRevision == current.CheckpointRevision);
+            if (!string.IsNullOrWhiteSpace(expectedLeaseOwner))
+                query = query.Where(x => x.LeaseOwner == expectedLeaseOwner);
+            if (expectedRecoveryCount is not null)
+                query = query.Where(x => x.RecoveryCount == expectedRecoveryCount.Value);
+            int updated;
+            if (RunStatusMachine.IsTerminal(target))
+            {
+                var completedAt = current.CompletedAt ?? now;
+                var nextTerminalErrorCategory = string.Equals(target, "failed", StringComparison.Ordinal)
+                    ? string.IsNullOrWhiteSpace(terminalErrorCategory)
+                        ? current.TerminalErrorCategory
+                        : terminalErrorCategory.Trim()
+                    : null;
+                updated = await query.ExecuteUpdateAsync(setters => setters
+                    .SetProperty(x => x.Status, target)
+                    .SetProperty(x => x.Summary, nextSummary)
+                    .SetProperty(x => x.TerminalErrorCategory, nextTerminalErrorCategory)
+                    .SetProperty(x => x.CompletedAt, completedAt)
+                    .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                updated = await query.ExecuteUpdateAsync(setters => setters
+                    .SetProperty(x => x.Status, target)
+                    .SetProperty(x => x.Summary, nextSummary)
+                    .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+            }
+
+            if (updated == 1)
+            {
+                await CascadeChildStatusAsync(db, runId, target, now, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        throw new InvalidOperationException($"Run '{runId}' status changed too frequently to apply transition to '{target}'.");
+    }
+
+    private static async Task CascadeChildStatusAsync(LifecycleDbContext db, Guid parentRunId, string target,
+        DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        if (target == "cancelled")
+        {
+            await db.Runs.Where(x => x.ParentRunId == parentRunId
+                    && x.Status != "completed" && x.Status != "failed" && x.Status != "cancelled")
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(x => x.Status, "cancelled")
+                    .SetProperty(x => x.CompletedAt, now)
+                    .SetProperty(x => x.Summary, "Cancelled with the parent run.")
+                    .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+        }
+        else if (target == "paused")
+        {
+            await db.Runs.Where(x => x.ParentRunId == parentRunId
+                    && (x.Status == "executing" || x.Status == "reviewing"))
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(x => x.Status, "paused")
+                    .SetProperty(x => x.Summary, "Paused with the parent run.")
+                    .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+        }
+        else if (target == "executing")
+        {
+            await db.Runs.Where(x => x.ParentRunId == parentRunId && x.Status == "paused")
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(x => x.Status, "executing")
+                    .SetProperty(x => x.Summary, "Resumed with the parent run.")
+                    .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async Task<EventIndexRecord> AppendEventAsync(
@@ -198,7 +402,8 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
         Guid? taskId = null,
         Guid? approvalId = null,
         string? toolId = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? idempotencyKey = null)
     {
         if (string.IsNullOrWhiteSpace(eventType) || string.IsNullOrWhiteSpace(summary))
         {
@@ -210,6 +415,15 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
         try
         {
             await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                // Event idempotency (plan §3.3 item 6): terminal events must be
+                // persisted exactly once, mirroring the run stream's key semantics.
+                var existing = await db.EventIndex.AsNoTracking()
+                    .SingleOrDefaultAsync(x => x.RunId == runId && x.IdempotencyKey == idempotencyKey, cancellationToken)
+                    .ConfigureAwait(false);
+                if (existing is not null) return existing;
+            }
             var run = await db.Runs.SingleOrDefaultAsync(x => x.Id == runId, cancellationToken).ConfigureAwait(false)
                 ?? throw new KeyNotFoundException("Run was not found.");
             var session = await _sessions.FindAsync(run.SessionId, cancellationToken).ConfigureAwait(false)
@@ -243,7 +457,7 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
                 ToolId = toolId, Summary = summary, SchemaVersion = record.Version,
                 PayloadHash = Convert.ToHexString(SHA256.HashData(serialized)).ToLowerInvariant(),
                 RelativeFilePath = Path.Combine("events", runId + ".events.jsonl"), ByteOffset = location.Offset,
-                ByteLength = location.Length, Timestamp = timestamp
+                ByteLength = location.Length, Timestamp = timestamp, IdempotencyKey = idempotencyKey
             };
             await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             db.EventIndex.Add(index);
@@ -319,7 +533,21 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
                 read += count;
             }
             if (read != bytes.Length) continue;
-            var record = JsonSerializer.Deserialize<EventFileRecord>(bytes, JsonOptions);
+            EventFileRecord? record;
+            try
+            {
+                record = JsonSerializer.Deserialize<EventFileRecord>(bytes, JsonOptions);
+            }
+            catch (JsonException)
+            {
+                // 与 ReconcileAsync 同一容错口径：单个损坏/错位的事件行（追加写入途中
+                // 进程被强杀，或 event_index 的 ByteOffset/ByteLength 与文件实际字节错位）
+                // 不得让整个 replay/follow 端点 500——那会打断整条事件流，聊天与运行状态
+                // 全部不可见。文件行本身通常仍合法（ReconcileAsync 启动时按换行重建索引会
+                // 补齐缺失行），这里只跳过索引错位的单行并留痕，保持事件流可用。
+                _diagnostics.Add($"Ignoring malformed JSONL record for run {row.RunId} at byte {row.ByteOffset}.");
+                continue;
+            }
             if (record is null) continue;
             events.Add(new EventEnvelope { Version = record.Version, EventId = record.EventId.ToString(), EventType = record.EventType, Timestamp = record.Timestamp, SessionId = record.SessionId.ToString(), RunId = record.RunId.ToString(), Payload = new Dictionary<string, object?> { ["sequence"] = record.Sequence, ["summary"] = record.Summary, ["severity"] = record.Severity, ["payload"] = record.Payload } });
         }
@@ -335,6 +563,61 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
         return runs.OrderByDescending(x => x.CreatedAt).ToList();
     }
 
+    public async Task<IReadOnlyList<Guid>> ListCancelledRunsMissingTerminalStreamAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var cancelled = await db.Runs.AsNoTracking()
+            .Where(x => x.Status == "cancelled" && x.TurnId != null)
+            .Select(x => x.Id)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        if (cancelled.Count == 0) return [];
+
+        var closed = await db.RunStream.AsNoTracking()
+            .Where(x => cancelled.Contains(x.RunId)
+                && x.Kind == "done"
+                && x.FinishReason == "cancelled")
+            .Select(x => x.RunId)
+            .Distinct()
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var closedSet = closed.ToHashSet();
+        return cancelled.Where(id => !closedSet.Contains(id)).ToArray();
+    }
+
+    public async Task<IReadOnlyList<Guid>> ListFailedRunsMissingTerminalStreamAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var failed = await db.Runs.AsNoTracking()
+            .Where(x => x.Status == "failed" && x.TurnId != null)
+            .Select(x => x.Id)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        if (failed.Count == 0) return [];
+
+        var closed = await db.RunStream.AsNoTracking()
+            .Where(x => failed.Contains(x.RunId) && x.Kind == "error")
+            .Select(x => x.RunId)
+            .Distinct()
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var closedSet = closed.ToHashSet();
+        return failed.Where(id => !closedSet.Contains(id)).ToArray();
+    }
+
+    public async Task<IReadOnlyList<Guid>> ListTerminalRunsWithPendingQueuedInteractionsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        return await db.RunDirectives.AsNoTracking()
+            .Where(directive => directive.RunId != null
+                && directive.Status == "pending"
+                && directive.Kind == "queued_interaction"
+                && db.Runs.Any(run => run.Id == directive.RunId
+                    && (run.Status == "completed" || run.Status == "failed" || run.Status == "cancelled")))
+            .Select(directive => directive.RunId!.Value)
+            .Distinct()
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// Lists active runs whose lease can be recovered. Runs younger than the
     /// admission grace period are skipped: a submit is still freezing the run
@@ -344,19 +627,20 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
     public async Task<IReadOnlyList<RunRecord>> ListLeaseEligibleRunsAsync(DateTimeOffset now, CancellationToken cancellationToken = default)
     {
         var nowUnixMilliseconds = now.ToUnixTimeMilliseconds();
-        var admissionGrace = now.AddSeconds(-AdmissionGracePeriodSeconds);
+        var admissionGrace = now.AddSeconds(-RecoveryPolicy.AdmissionGraceSeconds);
         await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         // ponytail: EF Core SQLite cannot translate DateTimeOffset comparisons, so the admission-grace
         // filter runs in memory; a stored unix-ms column would keep it in SQL when the runs table grows.
         var runs = await db.Runs.AsNoTracking()
-            .Where(x => x.Status != "completed" && x.Status != "failed" && x.Status != "cancelled"
-                && x.Status != "awaiting_delegate" && x.Status != "awaiting_user" && x.Status != "awaiting_approval"
-                && (x.LeaseOwner == null || x.LeaseExpiresUnixMilliseconds == null || x.LeaseExpiresUnixMilliseconds <= nowUnixMilliseconds))
+            .Where(x => x.LeaseOwner == null || x.LeaseExpiresUnixMilliseconds == null || x.LeaseExpiresUnixMilliseconds <= nowUnixMilliseconds)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
-        return runs.Where(x => x.CreatedAt <= admissionGrace).OrderBy(x => x.UpdatedAt).ToList();
+        // Protection + grace come from the shared RecoveryPolicy (plan §4.3 item 5):
+        // awaiting_* decision states and terminal runs are never lease-eligible.
+        return runs
+            .Where(x => !RunStatusMachine.IsTerminal(x.Status) && !RecoveryPolicy.IsAwaitingDecision(x.Status))
+            .Where(x => RecoveryPolicy.IsAdmissionGraceElapsed(x.CreatedAt, now))
+            .OrderBy(x => x.UpdatedAt).ToList();
     }
-
-    private const int AdmissionGracePeriodSeconds = 30;
 
     /// <summary>
     /// Persists one resolved run configuration as immutable content. Repeating the
@@ -457,6 +741,11 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
         if (key.Length > 256) throw new ArgumentException("Checkpoint idempotency key is too long.", nameof(checkpoint));
         var phase = checkpoint.Phase.Trim();
         if (phase.Length > 64) throw new ArgumentException("Checkpoint phase is too long.", nameof(checkpoint));
+        var expectedRunStatus = string.IsNullOrWhiteSpace(checkpoint.ExpectedRunStatus)
+            ? null
+            : checkpoint.ExpectedRunStatus.Trim().ToLowerInvariant();
+        if (expectedRunStatus is not null && !RunStatusMachine.IsKnown(expectedRunStatus))
+            throw new ArgumentException($"Unknown expected run status '{checkpoint.ExpectedRunStatus}'.", nameof(checkpoint));
         var appliedThroughEventSequence = Math.Max(0, checkpoint.AppliedThroughEventSequence);
         var bytes = Encoding.UTF8.GetBytes(checkpoint.Content);
         var requestedHash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
@@ -485,7 +774,14 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
 
         await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        var updated = await db.Runs.Where(x => x.Id == runId && x.CheckpointRevision == checkpoint.ExpectedRevision)
+        var runUpdate = db.Runs.Where(x => x.Id == runId && x.CheckpointRevision == checkpoint.ExpectedRevision);
+        if (expectedRunStatus is not null) runUpdate = runUpdate.Where(x => x.Status == expectedRunStatus);
+        if (checkpoint.RequireCompletionUnclaimed) runUpdate = runUpdate.Where(x => x.CompletedAt == null);
+        if (!string.IsNullOrWhiteSpace(checkpoint.ExpectedLeaseOwner))
+            runUpdate = runUpdate.Where(x => x.LeaseOwner == checkpoint.ExpectedLeaseOwner);
+        if (checkpoint.ExpectedRecoveryCount is not null)
+            runUpdate = runUpdate.Where(x => x.RecoveryCount == checkpoint.ExpectedRecoveryCount.Value);
+        var updated = await runUpdate
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.CurrentCheckpointId, record.Id)
                 .SetProperty(x => x.CheckpointRevision, record.Revision)
@@ -520,6 +816,80 @@ public sealed class StorageLifecycleService : IStorageMigrationParticipant
         if (run?.CurrentCheckpointId is not { } checkpointId) return null;
         var checkpoint = await db.RunCheckpoints.AsNoTracking().SingleOrDefaultAsync(x => x.Id == checkpointId && x.RunId == runId, cancellationToken).ConfigureAwait(false);
         return checkpoint is null ? null : await ReadCheckpointAsync(checkpoint, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<RunDirective>> ListPendingRunDirectivesAsync(Guid runId, CancellationToken cancellationToken = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var rows = await db.RunDirectives.AsNoTracking()
+            .Where(x => x.RunId == runId && x.Status == "pending")
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return rows.OrderBy(x => x.CreatedAt).ThenBy(x => x.Id)
+            .Select(x => new RunDirective(x.Id, x.SessionId, x.Kind, x.PayloadJson, x.IdempotencyKey))
+            .ToList();
+    }
+
+    public async Task<RunDirectiveDrainResult> DrainRunDirectivesAsync(Guid runId, IReadOnlyList<Guid> directiveIds, string drainedStatus, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(directiveIds);
+        if (directiveIds.Count == 0) return new RunDirectiveDrainResult(0);
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var now = DateTimeOffset.UtcNow;
+        var updated = await db.RunDirectives
+            .Where(x => x.RunId == runId && directiveIds.Contains(x.Id) && x.Status == "pending")
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, drainedStatus)
+                .SetProperty(x => x.DrainedAt, now)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+        return new RunDirectiveDrainResult(updated);
+    }
+
+    public async Task<int> RequeueRunDirectivesAsync(Guid fromRunId, IReadOnlyList<Guid> directiveIds, Guid toRunId, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(directiveIds);
+        if (directiveIds.Count == 0 || fromRunId == toRunId) return 0;
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var target = await db.Runs.AsNoTracking().Where(x => x.Id == toRunId).Select(x => new { x.SessionId }).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException("Target run was not found.");
+        var now = DateTimeOffset.UtcNow;
+        // Only pending rows of the same session move; CreatedAt is untouched, so the order survives the move.
+        return await db.RunDirectives
+            .Where(x => x.RunId == fromRunId && directiveIds.Contains(x.Id) && x.Status == "pending" && x.SessionId == target.SessionId)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.RunId, toRunId)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<RunDirective> EnqueueRunDirectiveAsync(RunDirectiveWrite write, CancellationToken cancellationToken = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(write.IdempotencyKey))
+        {
+            var replay = await db.RunDirectives.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.IdempotencyKey == write.IdempotencyKey, cancellationToken).ConfigureAwait(false);
+            if (replay is not null)
+                return new RunDirective(replay.Id, replay.SessionId, replay.Kind, replay.PayloadJson, replay.IdempotencyKey);
+        }
+        var run = await db.Runs.AsNoTracking().SingleOrDefaultAsync(x => x.Id == write.TargetRunId, cancellationToken).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException("Target run was not found.");
+        var row = new RunDirectiveRecord
+        {
+            Id = Guid.NewGuid(),
+            TenantId = run.TenantId,
+            WorkspaceId = run.WorkspaceId,
+            SessionId = write.SessionId,
+            RunId = write.TargetRunId,
+            MessageId = write.MessageId,
+            Kind = write.Kind,
+            Status = "pending",
+            PayloadJson = write.PayloadJson,
+            IdempotencyKey = write.IdempotencyKey,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        db.RunDirectives.Add(row);
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return new RunDirective(row.Id, row.SessionId, row.Kind, row.PayloadJson, row.IdempotencyKey);
     }
 
     public async Task<RunLease> TryAcquireRunLeaseAsync(Guid runId, string ownerId, TimeSpan duration, CancellationToken cancellationToken = default)
@@ -1052,7 +1422,7 @@ public sealed class EventFileRecord
     public Guid EventId { get; set; }
     public Guid RunId { get; set; }
     public Guid SessionId { get; set; }
-    public Guid ProjectId { get; set; }
+    public Guid? ProjectId { get; set; }
     public string EventType { get; set; } = string.Empty;
     public string Severity { get; set; } = "info";
     public long Sequence { get; set; }
@@ -1077,47 +1447,26 @@ public sealed record RunStartOptions(
     long ContextRevision,
     long ConfigurationVersion,
     string ConfigurationHash,
-    string ApplicationMode,
-    string AgentMode,
     string PermissionMode,
     string RuntimeProfileId,
-    string? InitiatedByPrincipalId = null);
+    string? InitiatedByPrincipalId = null,
+    string? ParentRunId = null,
+    string? ParentTaskId = null,
+    string RunKind = "root");
 
-public static class RunStatusMachine
-{
-    private static readonly HashSet<string> Known = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "planning", "understanding", "executing", "replanning", "awaiting_approval", "awaiting_delegate", "awaiting_user", "paused", "reviewing", "completed", "failed", "cancelled"
-    };
-
-    public static bool IsKnown(string status) => Known.Contains(status);
-    public static bool IsTerminal(string status) => status is "completed" or "failed" or "cancelled";
-    public static bool CanTransition(string from, string to)
-    {
-        if (string.Equals(from, to, StringComparison.OrdinalIgnoreCase)) return true;
-        if (IsTerminal(from)) return false;
-        return to switch
-        {
-            "cancelled" => true,
-            "failed" => true,
-            "planning" => from is "planning",
-            "understanding" => from is "planning",
-            "executing" => from is "planning" or "understanding" or "replanning" or "paused" or "awaiting_approval" or "awaiting_delegate" or "awaiting_user" or "reviewing",
-            "replanning" => from is "understanding" or "executing" or "awaiting_approval" or "reviewing",
-            "awaiting_approval" => from is "understanding" or "executing" or "replanning",
-            "awaiting_delegate" => from is "understanding" or "executing" or "replanning" or "awaiting_approval",
-            "awaiting_user" => from is "understanding" or "executing" or "replanning" or "awaiting_approval" or "awaiting_delegate" or "reviewing",
-            "reviewing" => from is "executing",
-            "paused" => from is "understanding" or "executing" or "replanning" or "awaiting_approval" or "awaiting_delegate" or "awaiting_user" or "reviewing",
-            "completed" => from is "executing" or "reviewing",
-            _ => false
-        };
-    }
-}
+// RunStatusMachine lives in TinadecCore.Abstractions (shared Contracts/Abstractions
+// layer, plan §3.3 item 3); Lifecycle consumes the shared rules without a local copy.
 
 public sealed class StorageDiagnostics
 {
+    private const int MaxMessages = 256;
     private readonly ConcurrentQueue<string> _messages = new();
     public IReadOnlyList<string> Messages => _messages.ToArray();
-    public void Add(string message) => _messages.Enqueue(message);
+    public void Add(string message)
+    {
+        _messages.Enqueue(message);
+        // 有界：MaterializeAsync 可能在 replay/follow 路径反复跳过同一损坏行，
+        // 无界队列会被刷爆；超过上限丢弃最旧消息。
+        while (_messages.Count > MaxMessages && _messages.TryDequeue(out _)) { }
+    }
 }

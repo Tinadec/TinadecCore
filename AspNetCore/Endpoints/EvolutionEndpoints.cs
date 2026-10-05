@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using TinadecCore.Abstractions.Ports;
 using TinadecCore.Contracts.Dtos;
 using TinadecCore.DmaEA;
 
@@ -9,10 +10,12 @@ namespace TinadecCore.AspNetCore.Endpoints;
 /// <summary>
 /// Agent evolution surface: a durable alias of the agent-candidate review flow.
 /// Generate persists a reviewed proposal from a run-scoped evolution agent;
-/// proposals list proposals and reject them. Profile publication is deliberately
-/// fail-closed until the staged sanitization/evaluation/review/publish/canary/
-/// activation pipeline exists. Model generation happens inside the run
-/// (experience curator); this endpoint only persists candidate proposals.
+/// proposals list proposals and reject them. Promotion is review-driven: the
+/// endpoint sanitizes the immutable proposal, publishes an immutable agent
+/// version through the AgentConfiguration boundary, and records the decision.
+/// Canary and activation remain future pipeline stages. Model generation
+/// happens inside the run (experience curator); this endpoint only persists
+/// and reviews candidate proposals.
 /// </summary>
 public static class EvolutionEndpoints
 {
@@ -25,6 +28,7 @@ public static class EvolutionEndpoints
                 var candidates = await instances.ListCandidatesAsync(status, ct);
                 return Results.Ok(candidates.Select(ToProposal));
             }
+            catch (ReviewFilterValueException ex) { return MemoryReviewEndpoints.ReviewFilterFailure(ex); }
             catch (ArgumentException ex) { return Results.BadRequest(new { code = "INVALID_STATUS", message = ex.Message }); }
         });
 
@@ -51,16 +55,73 @@ public static class EvolutionEndpoints
             catch (UnauthorizedAccessException ex) { return Results.Json(new { code = "FORBIDDEN_PROPOSAL", message = ex.Message }, statusCode: 403); }
         });
 
-        // Keep the legacy route as an explicit fail-closed compatibility surface.
-        // A candidate cannot become a profile through one review call; the staged
-        // evolution pipeline will own publication once it is implemented.
-        app.MapPost("/api/v1/agent-evolution/proposals/{candidateId}/promote", (Guid candidateId) =>
-            Results.Conflict(new
+        // Promotion is a human review decision: sanitize the immutable proposal,
+        // publish an immutable agent version, and record the decision. Canary and
+        // activation remain future pipeline stages.
+        app.MapPost("/api/v1/agent-evolution/proposals/{candidateId}/promote", async (Guid candidateId, ReviewDecisionRequest? request, IAgentInstanceService instances, TinadecCore.AgentConfiguration.IAgentConfigurationService configurations, CancellationToken ct) =>
+            await AgentCandidatePromotion.PromoteAsync(instances, configurations, candidateId, request?.Reason, ct));
+
+        // Evaluation evidence for human review: the proposal plus the replayed
+        // source run (task outcomes, supervision rounds, milestones).
+        app.MapGet("/api/v1/agent-evolution/proposals/{candidateId}/evaluation", async (Guid candidateId, IAgentInstanceService instances, IRunReplayService replay, CancellationToken ct) =>
+        {
+            try
             {
-                code = "candidate_pipeline_required",
-                candidate_id = candidateId,
-                message = "Candidate promotion is disabled until sanitization, evaluation, review, publish, canary, and activation complete."
-            }));
+                var (candidate, proposal) = await instances.GetCandidateWithProposalAsync(candidateId, ct);
+                var sourceReplay = await replay.BuildReplayAsync(candidate.SourceRunId.ToString(), ct);
+                return Results.Ok(new
+                {
+                    candidate_id = candidate.Id,
+                    name = candidate.Name,
+                    layer = candidate.Layer,
+                    agent_type = candidate.AgentType,
+                    status = candidate.Status,
+                    confidence = candidate.ConfidenceScore,
+                    proposal,
+                    source_run_replay = sourceReplay is null ? null : new
+                    {
+                        run_id = sourceReplay.RunId,
+                        status = sourceReplay.Status,
+                        tasks = sourceReplay.Tasks.Select(task => new
+                        {
+                            task_key = task.TaskKey,
+                            lane_key = task.LaneKey,
+                            status = task.Status,
+                            summary = task.Summary,
+                            evidence = task.Evidence
+                        }),
+                        lanes = sourceReplay.Lanes.Select(lane => new
+                        {
+                            lane_key = lane.LaneKey,
+                            status = lane.Status,
+                            escalated = lane.Escalated,
+                            task_keys = lane.TaskKeys,
+                            waits = lane.Waits.Select(w => new
+                            {
+                                waiting_task = w.WaitingTaskKey,
+                                lane = w.Lane,
+                                predicate = w.Predicate
+                            })
+                        }),
+                        supervision_rounds = sourceReplay.SupervisionRounds.Select(round => new
+                        {
+                            revision_round = round.RevisionRound,
+                            decision = round.Decision,
+                            reasons = round.Reasons
+                        }),
+                        milestones = sourceReplay.Milestones.Select(milestone => new
+                        {
+                            event_type = milestone.EventType,
+                            timestamp = milestone.Timestamp
+                        })
+                    }
+                });
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.NotFound(new { code = "NOT_FOUND", candidate_id = candidateId, message = "Agent candidate was not found." });
+            }
+        });
 
         app.MapPost("/api/v1/agent-evolution/proposals/{candidateId}/reject", async (Guid candidateId, ReviewDecisionRequest? request, IAgentInstanceService instances, CancellationToken ct) =>
             await DecideAsync(instances, candidateId, "rejected", request, ct));
@@ -75,11 +136,9 @@ public static class EvolutionEndpoints
             var candidate = await instances.DecideCandidateAsync(candidateId, decision, request?.Reason, ct);
             return Results.Ok(ToProposal(candidate));
         }
-        catch (AgentCandidatePipelineRequiredException ex) { return Results.Conflict(new { code = "candidate_pipeline_required", candidate_id = ex.CandidateId, message = ex.Message }); }
         catch (KeyNotFoundException) { return Results.NotFound(new { code = "NOT_FOUND", message = "Agent proposal was not found." }); }
         catch (ArgumentException ex) { return Results.BadRequest(new { code = "INVALID_DECISION", message = ex.Message }); }
         catch (InvalidOperationException ex) { return Results.Conflict(new { code = "ALREADY_DECIDED", message = ex.Message }); }
-        catch (UnauthorizedAccessException ex) { return Results.Json(new { code = "FORBIDDEN_PROMOTION", message = ex.Message }, statusCode: 403); }
     }
 
     private static object ToProposal(AgentCandidateRecord candidate) => new

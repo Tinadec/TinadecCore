@@ -36,10 +36,8 @@ public sealed class AutonomousLifecycle : Migration
         alter table runs add column if not exists context_revision bigint not null default 0;
         alter table runs add column if not exists configuration_version bigint not null default 0;
         alter table runs add column if not exists configuration_hash varchar(128) not null default '';
-        alter table runs add column if not exists application_mode varchar(64) not null default 'conversation';
-        alter table runs add column if not exists agent_mode varchar(64) not null default 'auto';
         alter table runs add column if not exists permission_mode varchar(64) not null default 'default';
-        alter table runs add column if not exists runtime_profile_id varchar(256) not null default 'conversation.auto';
+        alter table runs add column if not exists runtime_profile_id varchar(256) not null default '';
         create table if not exists tool_executions (id uuid primary key, tenant_id uuid not null, workspace_id uuid not null, project_id uuid null, session_id uuid not null, run_id uuid not null, task_id uuid not null, agent_instance_id uuid not null, approval_id uuid null, tool_id varchar(256) not null, risk varchar(32) not null, requires_approval boolean not null, status varchar(32) not null, parameters_hash varchar(128) not null, parameters_reference varchar(1024) not null, parameters_length bigint not null, result_reference varchar(1024) null, result_hash varchar(128) null, result_length bigint null, attempt integer not null, created_at timestamptz not null, updated_at timestamptz not null, completed_at timestamptz null);
         create index if not exists ix_tool_executions_run_created on tool_executions(tenant_id, workspace_id, run_id, created_at);
         """);
@@ -53,7 +51,6 @@ public sealed class AutonomousAgentControl : Migration
     protected override void Up(MigrationBuilder m) => m.Sql("""
         create table if not exists agent_instances (id uuid primary key, tenant_id uuid not null, workspace_id uuid not null, session_id uuid not null, run_id uuid not null, task_node_id uuid null, parent_instance_id uuid null, profile_id uuid null, created_by_profile_id uuid null, layer varchar(32) not null, role varchar(128) not null, generation_depth integer not null, generated boolean not null, status varchar(32) not null, definition_reference varchar(1024) not null, definition_hash varchar(128) not null, definition_length bigint not null, created_at timestamptz not null, updated_at timestamptz not null, released_at timestamptz null);
         create table if not exists agent_candidates (id uuid primary key, tenant_id uuid not null, workspace_id uuid not null, project_id uuid null, source_run_id uuid not null, source_instance_id uuid not null, generated_by_instance_id uuid not null, name varchar(256) not null, layer varchar(32) not null, agent_type varchar(128) not null, status varchar(32) not null, confidence_score double precision not null, proposal_reference varchar(1024) not null, proposal_hash varchar(128) not null, proposal_length bigint not null, promoted_agent_id uuid null, decision_reason text null, created_by_principal_id uuid not null, decided_by_principal_id uuid null, created_at timestamptz not null, updated_at timestamptz not null);
-        create table if not exists runtime_profile_overrides (id uuid primary key, tenant_id uuid not null, workspace_id uuid not null, profile_id varchar(256) not null, version integer not null, enabled boolean not null, content_reference varchar(1024) not null, content_hash varchar(128) not null, content_length bigint not null, created_by_principal_id uuid not null, created_at timestamptz not null);
         """);
     protected override void Down(MigrationBuilder m) { }
 }

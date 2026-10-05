@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using TinadecCore.Abstractions;
@@ -13,6 +14,8 @@ using TinadecCore.Models;
 using TinadecCore.Prompts;
 using TinadecCore.Skills;
 using TinadecCore.Tenancy;
+using TinadecCore.AgentGraph;
+using TinadecCore.TinaChat;
 using TinadecCore.Tools;
 using TinadecCore.VectorStore;
 
@@ -47,16 +50,59 @@ public static class TinadecCoreServiceCollectionExtensions
         new ToolsModuleRegistrar().Register(builder);
         new DmaEAModuleRegistrar().Register(builder);
 
+        new AgentGraphModuleRegistrar().Register(builder);
+        new TinaChatModuleRegistrar().Register(builder);
+        services.AddSingleton<ITinaChatIdentityBoundary, TinaChatIdentityBoundary>();
+        services.AddSingleton<ITinaChatObserverAuthority, TinaChatObserverAuthority>();
+        services.AddSingleton<ITinaChatRunService, TinaChatRunService>();
+        services.AddSingleton<IExecutorMessageWakeSink, ExecutorMessageWakeSink>();
+        // Governance reports use one runtime action port. The adapter checks the
+        // target run's tenant/workspace/session before it reaches run control.
+        services.AddSingleton<IGovernanceRunController, GovernanceRunController>();
+        services.AddSingleton<IOrganizationReportActionExecutor, OrganizationReportActionExecutor>();
+        // The handoff tool needs the mode catalog and the coordinator, so the composition root wraps
+        // the module's gateway rather than giving the communication module a dependency that would
+        // point back at itself.
+        services.Replace(ServiceDescriptor.Singleton<ITinaChatToolGateway>(sp => new TinaChatHandoffGateway(
+            sp.GetRequiredService<TinaChatService>(),
+            sp.GetRequiredService<ITinaChatRunService>(),
+            sp.GetRequiredService<ITenantContextAccessor>(),
+            sp.GetRequiredService<IDbContextFactory<AgentConfigurationDbContext>>())));
+        // The session as a graph (runs, instances, tasks, leases, organization members): composed here
+        // because only the host reads across those modules. Serves graph_view and the topology endpoint.
+        services.AddSingleton<ISessionTopology, SessionTopologyService>();
+        // TinaChat turns are owed by durable rows, not by this process: one singleton scheduler drains them.
+        services.AddSingleton<TinaChatWakeService>();
+        services.AddHostedService(sp => sp.GetRequiredService<TinaChatWakeService>());
+        // Delegated approval gates (the delegate-* permission modes): one singleton asks each approval's
+        // gates in order and applies the outcome; the same instance serves the gates' read side.
+        services.AddOptions<ApprovalGateOptions>().BindConfiguration(ApprovalGateOptions.SectionName);
+        services.AddSingleton<ApprovalGateService>();
+        services.AddSingleton<IApprovalGateLedger>(sp => sp.GetRequiredService<ApprovalGateService>());
+        services.AddHostedService(sp => sp.GetRequiredService<ApprovalGateService>());
+
         // Governance is registered before DmaEA so it can remain independently
         // packageable. The composition root replaces its fail-closed placeholder
         // with the Core-state resolver only in the full runtime.
         services.Replace(ServiceDescriptor.Singleton<IAuthorizationContextResolver, CoreAuthorizationContextResolver>());
         services.AddSingleton<TinadecCore.Abstractions.Ports.IFormalModeResolver, FormalModeResolver>();
         services.AddSingleton<IAgentModelResolver, AgentModelResolver>();
+        // The pack purge reaches the run/memory stores through this port so
+        // AgentConfiguration keeps depending on Abstractions only.
+        services.AddSingleton<IAgentPackResourceStore, AgentPackResourceStore>();
         services.AddSingleton<UserToolActionService>();
         services.AddSingleton<IUserToolActionService>(sp => sp.GetRequiredService<UserToolActionService>());
         services.AddSingleton<IUserToolActionRecovery>(sp => sp.GetRequiredService<UserToolActionService>());
-        services.AddHostedService<UserToolActionRecoveryHostedService>();
+        // Single recovery orchestration point (plan §4.3 item 5): startup orphan scan
+        // + user tool action recovery in one ordered pass, one policy (RecoveryPolicy).
+        services.AddSingleton<RecoveryCoordinator>();
+        services.AddHostedService(sp => sp.GetRequiredService<RecoveryCoordinator>());
+
+        // Phase 3 startup experience: model connectivity probe (60s in-memory cache,
+        // consumed by the readiness receipt's model_probe item) and the unified
+        // readiness receipt aggregator. Both are stateless singletons over ports.
+        services.AddSingleton<ModelProbeService>();
+        services.AddSingleton<ReadinessService>();
 
         // Rebind ToolDispatchOptions from the frozen TOML runtime profile (this factory
         // registration replaces the defaults the Tools module registered; DI resolves

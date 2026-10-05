@@ -39,6 +39,27 @@ public sealed class ToolWireResponseDto
     public string? Error { get; init; }
 }
 
+/// <summary>
+/// Unsolicited notification a TinadecTools child process emits <em>while</em> a call is in
+/// flight. Event lines are distinguished from responses by their <c>kind</c> field.
+/// <c>call_id</c> &lt;= 0 designates a broadcast event, e.g. the exit of a long-lived
+/// terminal session whose originating call has already returned.
+/// </summary>
+public sealed class ToolWireEventDto
+{
+    [JsonPropertyName("kind")]
+    public string Kind { get; init; } = "event";
+
+    [JsonPropertyName("call_id")]
+    public long CallId { get; init; }
+
+    [JsonPropertyName("event")]
+    public string Event { get; init; } = string.Empty;
+
+    [JsonPropertyName("payload")]
+    public JsonElement? Payload { get; init; }
+}
+
 /// <summary>Manifest handshake payload returned for the reserved <c>#manifest</c> tool call.</summary>
 public sealed class ToolManifestDto
 {
@@ -116,6 +137,15 @@ public sealed class ToolDispatchRequestDto
 
     [JsonIgnore]
     public int LeaseUses { get; init; } = 1;
+
+    /// <summary>
+    /// Lane the calling task belongs to; null reads as the implicit "main" lane.
+    /// Deliberately not deserializable: lane ownership is decided by the durable
+    /// task graph, and letting a client submit one would let it rewrite the
+    /// audit dimension that lane-scoped pre-authorizations are matched against.
+    /// </summary>
+    [JsonIgnore]
+    public string? LaneKey { get; init; }
 }
 
 /// <summary>
@@ -157,4 +187,12 @@ public sealed class ToolDispatchResultDto
 
     [JsonPropertyName("message")]
     public string? Message { get; init; }
+
+    /// <summary>
+    /// True when the approval decision window elapsed and the execution was
+    /// parked. Deliberately not serializable: it is an engine-internal escalation
+    /// signal, not part of the external dispatch contract.
+    /// </summary>
+    [JsonIgnore]
+    public bool ParkExpired { get; init; }
 }

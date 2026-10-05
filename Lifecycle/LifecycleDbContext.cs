@@ -21,6 +21,8 @@ public sealed class LifecycleDbContext : DbContext
     public DbSet<SessionMetadataSnapshotRecord> SessionMetadataSnapshots => Set<SessionMetadataSnapshotRecord>();
     public DbSet<UserToolActionRecord> UserToolActions => Set<UserToolActionRecord>();
     public DbSet<ModelInvocationRecord> ModelInvocations => Set<ModelInvocationRecord>();
+    public DbSet<RunDirectiveRecord> RunDirectives => Set<RunDirectiveRecord>();
+    public DbSet<PreAuthorizationRecord> PreAuthorizations => Set<PreAuthorizationRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -32,6 +34,9 @@ public sealed class LifecycleDbContext : DbContext
             entity.Property(x => x.TenantId).HasColumnName("tenant_id");
             entity.Property(x => x.WorkspaceId).HasColumnName("workspace_id");
             entity.Property(x => x.SessionId).HasColumnName("session_id");
+            entity.Property(x => x.ParentRunId).HasColumnName("parent_run_id");
+            entity.Property(x => x.ParentTaskId).HasColumnName("parent_task_id");
+            entity.Property(x => x.RunKind).HasColumnName("run_kind").HasMaxLength(32).IsRequired();
             entity.Property(x => x.InitiatedByPrincipalId).HasColumnName("initiated_by_principal_id");
             entity.Property(x => x.TriggerMessageId).HasColumnName("trigger_message_id");
             entity.Property(x => x.TurnId).HasColumnName("turn_id");
@@ -40,11 +45,10 @@ public sealed class LifecycleDbContext : DbContext
             entity.Property(x => x.UpdatedAt).HasColumnName("updated_at");
             entity.Property(x => x.CompletedAt).HasColumnName("completed_at");
             entity.Property(x => x.Summary).HasColumnName("summary");
+            entity.Property(x => x.TerminalErrorCategory).HasColumnName("terminal_error_category");
             entity.Property(x => x.TaskRevision).HasColumnName("task_revision");
             entity.Property(x => x.LastEventSequence).HasColumnName("last_event_sequence");
             entity.Property(x => x.LastEventAt).HasColumnName("last_event_at");
-            entity.Property(x => x.ApplicationMode).HasMaxLength(64).IsRequired();
-            entity.Property(x => x.AgentMode).HasMaxLength(64).IsRequired();
             entity.Property(x => x.PermissionMode).HasMaxLength(64).IsRequired();
             entity.Property(x => x.RuntimeProfileId).HasMaxLength(256).IsRequired();
             entity.Property(x => x.ConfigurationHash).HasMaxLength(128).IsRequired();
@@ -54,8 +58,10 @@ public sealed class LifecycleDbContext : DbContext
             entity.Property(x => x.LeaseOwner).HasMaxLength(256);
             entity.Property(x => x.Status).HasMaxLength(64).IsRequired();
             entity.Property(x => x.Summary).HasMaxLength(4096);
+            entity.Property(x => x.TerminalErrorCategory).HasMaxLength(128);
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.SessionId, x.CreatedAt });
             entity.HasIndex(x => new { x.SessionId, x.Status, x.UpdatedAt });
+            entity.HasIndex(x => new { x.ParentRunId, x.ParentTaskId, x.Status });
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.SessionId, x.TriggerMessageId }).IsUnique();
             entity.HasIndex(x => new { x.Status, x.LeaseExpiresAt });
         });
@@ -83,19 +89,21 @@ public sealed class LifecycleDbContext : DbContext
             entity.Property(x => x.ByteOffset).HasColumnName("byte_offset");
             entity.Property(x => x.ByteLength).HasColumnName("byte_length");
             entity.Property(x => x.Timestamp).HasColumnName("timestamp");
+            entity.Property(x => x.IdempotencyKey).HasColumnName("idempotency_key");
             entity.Property(x => x.EventType).HasMaxLength(256).IsRequired();
             entity.Property(x => x.Severity).HasMaxLength(32).IsRequired();
             entity.Property(x => x.Summary).HasMaxLength(4096).IsRequired();
             entity.Property(x => x.SchemaVersion).HasMaxLength(32).IsRequired();
             entity.Property(x => x.PayloadHash).HasMaxLength(128).IsRequired();
             entity.Property(x => x.RelativeFilePath).HasMaxLength(512).IsRequired();
+            entity.HasIndex(x => new { x.RunId, x.IdempotencyKey }).IsUnique();
             entity.HasIndex(x => new { x.RunId, x.Sequence }).IsUnique();
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.SessionId, x.Timestamp });
             entity.HasIndex(x => new { x.ProjectId, x.Timestamp });
             entity.HasIndex(x => new { x.RunId, x.Sequence });
             entity.HasIndex(x => new { x.ApprovalId, x.EventType, x.Timestamp });
         });
-        modelBuilder.Entity<ApprovalRequestRecord>(entity => { entity.ToTable("approval_requests"); entity.HasKey(x => x.Id); entity.Property(x => x.Kind).HasMaxLength(64).IsRequired(); entity.Property(x => x.ToolId).HasMaxLength(256).IsRequired(); entity.Property(x => x.Risk).HasMaxLength(32).IsRequired(); entity.Property(x => x.RequestHash).HasMaxLength(128).IsRequired(); entity.Property(x => x.NonceHash).HasMaxLength(128); entity.Property(x => x.NonceSecretReference).HasMaxLength(512); entity.Property(x => x.Status).HasMaxLength(32).IsRequired(); entity.Property(x => x.Decision).HasMaxLength(32); entity.Property(x => x.ParametersReference).HasMaxLength(1024).IsRequired(); entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Status, x.ExpiresAt }); entity.HasIndex(x => new { x.RunId, x.ToolId, x.RequestHash }); entity.HasIndex(x => x.ExecutionId); entity.HasIndex(x => x.UserToolActionId).IsUnique(); });
+        modelBuilder.Entity<ApprovalRequestRecord>(entity => { entity.ToTable("approval_requests"); entity.HasKey(x => x.Id); entity.Property(x => x.Kind).HasMaxLength(64).IsRequired(); entity.Property(x => x.ToolId).HasMaxLength(256).IsRequired(); entity.Property(x => x.Risk).HasMaxLength(32).IsRequired(); entity.Property(x => x.RequestHash).HasMaxLength(128).IsRequired(); entity.Property(x => x.NonceHash).HasMaxLength(128); entity.Property(x => x.NonceSecretReference).HasMaxLength(512); entity.Property(x => x.Status).HasMaxLength(32).IsRequired(); entity.Property(x => x.Decision).HasMaxLength(32); entity.Property(x => x.ParametersReference).HasMaxLength(1024).IsRequired(); entity.Property(x => x.ArgumentsDigest).HasMaxLength(4096).IsRequired(); entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.Status, x.ExpiresAt }); entity.HasIndex(x => new { x.RunId, x.ToolId, x.RequestHash }); entity.HasIndex(x => x.ExecutionId); entity.HasIndex(x => x.UserToolActionId).IsUnique(); });
         modelBuilder.Entity<ApprovalDecisionRecord>(entity => { entity.ToTable("approval_decisions"); entity.HasKey(x => x.Id); entity.Property(x => x.Decision).HasMaxLength(32).IsRequired(); entity.HasIndex(x => new { x.ApprovalRequestId, x.CreatedAt }); });
         modelBuilder.Entity<RunConfigurationBindingRecord>(entity => { entity.ToTable("run_configuration_bindings"); entity.HasKey(x => new { x.RunId, x.ConfigurationKind, x.ConfigurationVersionId }); entity.Property(x => x.ConfigurationKind).HasMaxLength(64).IsRequired(); entity.HasIndex(x => new { x.TenantId, x.ConfigurationVersionId }); });
         modelBuilder.Entity<ArtifactIndexRecord>(entity => { entity.ToTable("artifact_index"); entity.HasKey(x => x.Id); entity.Property(x => x.ContentReference).HasMaxLength(1024).IsRequired(); entity.Property(x => x.ContentHash).HasMaxLength(128).IsRequired(); entity.Property(x => x.MediaType).HasMaxLength(256).IsRequired(); entity.HasIndex(x => new { x.TenantId, x.RunId, x.CreatedAt }); });
@@ -104,8 +112,9 @@ public sealed class LifecycleDbContext : DbContext
         {
             entity.ToTable("tool_executions"); entity.HasKey(x => x.Id);
             entity.Property(x => x.ToolId).HasMaxLength(256).IsRequired(); entity.Property(x => x.ToolCallKey).HasMaxLength(512).IsRequired(); entity.Property(x => x.Status).HasMaxLength(32).IsRequired(); entity.Property(x => x.Risk).HasMaxLength(32).IsRequired(); entity.Property(x => x.ErrorCategory).HasMaxLength(128);
-        entity.Property(x => x.ParametersHash).HasMaxLength(128).IsRequired(); entity.Property(x => x.ParametersReference).HasMaxLength(1024).IsRequired(); entity.Property(x => x.ResultReference).HasMaxLength(1024);
-            entity.Property(x => x.PermissionRequestId);
+        entity.Property(x => x.ParametersHash).HasMaxLength(128).IsRequired(); entity.Property(x => x.ParametersReference).HasMaxLength(1024).IsRequired(); entity.Property(x => x.ArgumentsDigest).HasMaxLength(4096).IsRequired(); entity.Property(x => x.ResultReference).HasMaxLength(1024);
+        entity.Property(x => x.LaneKey).HasMaxLength(128);
+        entity.Property(x => x.PermissionRequestId);
             entity.Property(x => x.AuthorizationDecisionId);
             entity.Property(x => x.CapabilityLeaseId);
             entity.Property(x => x.WorkspaceSnapshotId);
@@ -200,6 +209,28 @@ public sealed class LifecycleDbContext : DbContext
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.ModeVersionId, x.StartedAt });
             entity.HasIndex(x => new { x.TenantId, x.WorkspaceId, x.ProviderInstanceId, x.Model, x.StartedAt });
         });
+        modelBuilder.Entity<RunDirectiveRecord>(entity =>
+        {
+            entity.ToTable("run_directives");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Kind).HasMaxLength(64).IsRequired();
+            entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.PayloadJson).HasMaxLength(16384).IsRequired();
+            entity.Property(x => x.IdempotencyKey).HasMaxLength(256);
+            entity.HasIndex(x => new { x.SessionId, x.Status, x.CreatedAt });
+            entity.HasIndex(x => x.IdempotencyKey).IsUnique();
+        });
+        modelBuilder.Entity<PreAuthorizationRecord>(entity =>
+        {
+            entity.ToTable("pre_authorizations");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.LaneKey).HasMaxLength(128);
+            entity.Property(x => x.ToolScopeJson).HasMaxLength(4096).IsRequired();
+            entity.Property(x => x.ParameterConstraintHash).HasMaxLength(128);
+            entity.Property(x => x.RiskMax).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.Summary).HasMaxLength(512);
+            entity.HasIndex(x => new { x.RunId, x.Revoked });
+        });
         modelBuilder.UseTinadecSnakeCase();
     }
 }
@@ -210,6 +241,10 @@ public sealed class RunRecord
     public Guid TenantId { get; set; }
     public Guid WorkspaceId { get; set; }
     public Guid SessionId { get; set; }
+    /// <summary>Null for a user-facing root run; set for an execution child run.</summary>
+    public Guid? ParentRunId { get; set; }
+    public Guid? ParentTaskId { get; set; }
+    public string RunKind { get; set; } = "root";
     public Guid InitiatedByPrincipalId { get; set; }
     public Guid TriggerMessageId { get; set; }
     public Guid? TurnId { get; set; }
@@ -218,16 +253,15 @@ public sealed class RunRecord
     public DateTimeOffset UpdatedAt { get; set; }
     public DateTimeOffset? CompletedAt { get; set; }
     public string? Summary { get; set; }
+    public string? TerminalErrorCategory { get; set; }
     public long TaskRevision { get; set; }
     public long LastEventSequence { get; set; }
     public DateTimeOffset? LastEventAt { get; set; }
     public long ContextRevision { get; set; }
     public long ConfigurationVersion { get; set; }
     public string ConfigurationHash { get; set; } = string.Empty;
-    public string ApplicationMode { get; set; } = "conversation";
-    public string AgentMode { get; set; } = "auto";
     public string PermissionMode { get; set; } = "default";
-    public string RuntimeProfileId { get; set; } = "conversation.auto";
+    public string RuntimeProfileId { get; set; } = string.Empty;
     public string? FrozenConfigurationReference { get; set; }
     public string? FrozenConfigurationHash { get; set; }
     public long? FrozenConfigurationLength { get; set; }
@@ -250,7 +284,7 @@ public sealed class EventIndexRecord
     public Guid WorkspaceId { get; set; }
     public Guid RunId { get; set; }
     public Guid SessionId { get; set; }
-    public Guid ProjectId { get; set; }
+    public Guid? ProjectId { get; set; }
     public string EventType { get; set; } = string.Empty;
     public string Severity { get; set; } = "info";
     public long Sequence { get; set; }
@@ -264,14 +298,15 @@ public sealed class EventIndexRecord
     public long ByteOffset { get; set; }
     public int ByteLength { get; set; }
     public DateTimeOffset Timestamp { get; set; }
+    public string? IdempotencyKey { get; set; }
 }
 
-public sealed class ApprovalRequestRecord { public Guid Id { get; set; } public Guid TenantId { get; set; } public Guid WorkspaceId { get; set; } public Guid? ProjectId { get; set; } public Guid? SessionId { get; set; } public Guid? RunId { get; set; } public Guid? TaskId { get; set; } public Guid? AgentInstanceId { get; set; } public Guid? ExecutionId { get; set; } public Guid? UserToolActionId { get; set; } public Guid? PolicyVersionId { get; set; } public string Kind { get; set; } = string.Empty; public string ToolId { get; set; } = string.Empty; public string Risk { get; set; } = "low"; public string RequestHash { get; set; } = string.Empty; public string? NonceHash { get; set; } public string? NonceSecretReference { get; set; } public string ParametersReference { get; set; } = string.Empty; public string Summary { get; set; } = string.Empty; public string Status { get; set; } = "pending"; public string? Decision { get; set; } public string? DecisionReason { get; set; } public DateTimeOffset? DecidedAt { get; set; } public DateTimeOffset ExpiresAt { get; set; } public Guid RequestedByPrincipalId { get; set; } public Guid? ConsumedByExecutionId { get; set; } public DateTimeOffset? ConsumedAt { get; set; } [System.ComponentModel.DataAnnotations.Schema.NotMapped] public string Nonce { get; set; } = string.Empty; public DateTimeOffset CreatedAt { get; set; } public DateTimeOffset UpdatedAt { get; set; } }
+public sealed class ApprovalRequestRecord { public Guid Id { get; set; } public Guid TenantId { get; set; } public Guid WorkspaceId { get; set; } public Guid? ProjectId { get; set; } public Guid? SessionId { get; set; } public Guid? RunId { get; set; } public Guid? TaskId { get; set; } public Guid? AgentInstanceId { get; set; } public Guid? ExecutionId { get; set; } public Guid? UserToolActionId { get; set; } public Guid? PolicyVersionId { get; set; } public string Kind { get; set; } = string.Empty; public string ToolId { get; set; } = string.Empty; public string Risk { get; set; } = "low"; public string RequestHash { get; set; } = string.Empty; public string? NonceHash { get; set; } public string? NonceSecretReference { get; set; } public string ParametersReference { get; set; } = string.Empty; public string ArgumentsDigest { get; set; } = string.Empty; public string Summary { get; set; } = string.Empty; public string Status { get; set; } = "pending"; public string? Decision { get; set; } public string? DecisionReason { get; set; } public DateTimeOffset? DecidedAt { get; set; } public DateTimeOffset ExpiresAt { get; set; } public DateTimeOffset? ExecutionWindowExpiresAt { get; set; } public Guid RequestedByPrincipalId { get; set; } public Guid? ConsumedByExecutionId { get; set; } public DateTimeOffset? ConsumedAt { get; set; } [System.ComponentModel.DataAnnotations.Schema.NotMapped] public string Nonce { get; set; } = string.Empty; public DateTimeOffset CreatedAt { get; set; } public DateTimeOffset UpdatedAt { get; set; } }
 public sealed class ApprovalDecisionRecord { public Guid Id { get; set; } public Guid ApprovalRequestId { get; set; } public string Decision { get; set; } = string.Empty; public string? Reason { get; set; } public Guid DecidedByPrincipalId { get; set; } public DateTimeOffset CreatedAt { get; set; } }
 public sealed class RunConfigurationBindingRecord { public Guid RunId { get; set; } public Guid TenantId { get; set; } public string ConfigurationKind { get; set; } = string.Empty; public Guid ConfigurationId { get; set; } public Guid ConfigurationVersionId { get; set; } public string ManifestHash { get; set; } = string.Empty; public DateTimeOffset BoundAt { get; set; } }
 public sealed class ArtifactIndexRecord { public Guid Id { get; set; } public Guid TenantId { get; set; } public Guid WorkspaceId { get; set; } public Guid RunId { get; set; } public Guid? TaskId { get; set; } public string ContentReference { get; set; } = string.Empty; public string ContentHash { get; set; } = string.Empty; public long ContentLength { get; set; } public string MediaType { get; set; } = string.Empty; public string Classification { get; set; } = "internal"; public DateTimeOffset CreatedAt { get; set; } public DateTimeOffset? DeletedAt { get; set; } }
 public sealed class ControlEventIndexRecord { public Guid Id { get; set; } public Guid TenantId { get; set; } public Guid? WorkspaceId { get; set; } public Guid? ProjectId { get; set; } public Guid? ActorPrincipalId { get; set; } public string AggregateType { get; set; } = string.Empty; public Guid AggregateId { get; set; } public string EventType { get; set; } = string.Empty; public string RelativeFilePath { get; set; } = string.Empty; public long ByteOffset { get; set; } public int ByteLength { get; set; } public string PayloadHash { get; set; } = string.Empty; public DateTimeOffset Timestamp { get; set; } }
-public sealed class ToolExecutionRecord { public Guid Id { get; set; } public Guid TenantId { get; set; } public Guid WorkspaceId { get; set; } public Guid? ProjectId { get; set; } public Guid SessionId { get; set; } public Guid RunId { get; set; } public Guid TaskId { get; set; } public Guid AgentInstanceId { get; set; } public Guid? ApprovalId { get; set; } public Guid? PermissionRequestId { get; set; } public Guid? AuthorizationDecisionId { get; set; } public Guid? CapabilityLeaseId { get; set; } public Guid? WorkspaceSnapshotId { get; set; } public string? WorkspaceSnapshotHash { get; set; } public string ToolId { get; set; } = string.Empty; public string ToolCallKey { get; set; } = string.Empty; public string Risk { get; set; } = "low"; public bool MutatesWorkspace { get; set; } public bool RequiresApproval { get; set; } public int LeaseUses { get; set; } = 1; public string Status { get; set; } = "requested"; public string ParametersHash { get; set; } = string.Empty; public string ParametersReference { get; set; } = string.Empty; public long ParametersLength { get; set; } public string? ResultReference { get; set; } public string? ResultHash { get; set; } public long? ResultLength { get; set; } public string? ErrorCategory { get; set; } public string? SafeErrorMessage { get; set; } public int Attempt { get; set; } = 1; public DateTimeOffset CreatedAt { get; set; } public DateTimeOffset UpdatedAt { get; set; } public DateTimeOffset? CompletedAt { get; set; } }
+public sealed class ToolExecutionRecord { public Guid Id { get; set; } public Guid TenantId { get; set; } public Guid WorkspaceId { get; set; } public Guid? ProjectId { get; set; } public Guid SessionId { get; set; } public Guid RunId { get; set; } public Guid TaskId { get; set; } public Guid AgentInstanceId { get; set; } public Guid? ApprovalId { get; set; } public Guid? PermissionRequestId { get; set; } public Guid? AuthorizationDecisionId { get; set; } public Guid? CapabilityLeaseId { get; set; } public Guid? WorkspaceSnapshotId { get; set; } public string? WorkspaceSnapshotHash { get; set; } public string ToolId { get; set; } = string.Empty; public string ToolCallKey { get; set; } = string.Empty; public string Risk { get; set; } = "low"; public bool MutatesWorkspace { get; set; } public bool RequiresApproval { get; set; } public int LeaseUses { get; set; } = 1; public string Status { get; set; } = "requested"; public string? LaneKey { get; set; } public string ParametersHash { get; set; } = string.Empty; public string ParametersReference { get; set; } = string.Empty; public string ArgumentsDigest { get; set; } = string.Empty; public long ParametersLength { get; set; } public string? ResultReference { get; set; } public string? ResultHash { get; set; } public long? ResultLength { get; set; } public string? ErrorCategory { get; set; } public string? SafeErrorMessage { get; set; } public bool? ToolSuccess { get; set; } public int Attempt { get; set; } = 1; public DateTimeOffset CreatedAt { get; set; } public DateTimeOffset UpdatedAt { get; set; } public DateTimeOffset? CompletedAt { get; set; } }
 public sealed class RunCheckpointRecord { public Guid Id { get; set; } public Guid TenantId { get; set; } public Guid WorkspaceId { get; set; } public Guid RunId { get; set; } public long Revision { get; set; } public string Phase { get; set; } = string.Empty; public string IdempotencyKey { get; set; } = string.Empty; public string ContentReference { get; set; } = string.Empty; public string ContentHash { get; set; } = string.Empty; public long ContentLength { get; set; } public long AppliedThroughEventSequence { get; set; } public DateTimeOffset CreatedAt { get; set; } }
 public sealed class RunStreamRecord { public Guid Id { get; set; } public Guid TenantId { get; set; } public Guid WorkspaceId { get; set; } public Guid RunId { get; set; } public Guid TurnId { get; set; } public Guid? MessageId { get; set; } public long Sequence { get; set; } public string Kind { get; set; } = string.Empty; public string? IdempotencyKey { get; set; } public string? DeltaReference { get; set; } public string? DeltaHash { get; set; } public long? DeltaLength { get; set; } public string? UsageReference { get; set; } public string? UsageHash { get; set; } public long? UsageLength { get; set; } public string? FinishReason { get; set; } public string? ErrorCategory { get; set; } public string? SafeErrorMessage { get; set; } public DateTimeOffset CreatedAt { get; set; } }
 public sealed class RunStreamCursorRecord { public Guid RunId { get; set; } public long NextSequence { get; set; } public DateTimeOffset UpdatedAt { get; set; } }
@@ -309,7 +344,7 @@ public sealed class SessionMetadataSnapshotRecord
     public Guid TenantId { get; set; }
     public Guid WorkspaceId { get; set; }
     public Guid SessionId { get; set; }
-    public Guid ProjectId { get; set; }
+    public Guid? ProjectId { get; set; }
     public string Kind { get; set; } = "session_runtime";
     public string Source { get; set; } = "lifecycle_projection";
     public string SchemaVersion { get; set; } = "1.0";
@@ -398,4 +433,54 @@ public sealed class ModelInvocationRecord
     public long? TotalTokens { get; set; }
     public DateTimeOffset StartedAt { get; set; }
     public DateTimeOffset? CompletedAt { get; set; }
+}
+
+/// <summary>
+/// A user-granted unattended approval budget for one run. Mint converts a
+/// pending tool approval into an approved one only while the grant has budget,
+/// the tool is in its scope, and the risk stays under its ceiling; wildcard
+/// scopes are rejected at mint time even if they are ever stored.
+/// </summary>
+public sealed class PreAuthorizationRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid RunId { get; set; }
+    public string? LaneKey { get; set; }
+    public string ToolScopeJson { get; set; } = "[]";
+    public string? ParameterConstraintHash { get; set; }
+    public string RiskMax { get; set; } = "low";
+    public int MaxUses { get; set; } = 1;
+    public int UseCount { get; set; }
+    public DateTimeOffset ExpiresAt { get; set; }
+    public bool Revoked { get; set; }
+    public DateTimeOffset? RevokedAt { get; set; }
+    public Guid GrantedByPrincipalId { get; set; }
+    public string? Summary { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}
+
+/// <summary>
+/// A durable orchestration instruction aimed at a run (or, from M1, a lane).
+/// Created today for interactions queued behind a busy meeting so a run-terminal
+/// hook can drain them; the row is the replacement for the transient interaction
+/// id the queued endpoint used to fabricate and lose.
+/// </summary>
+public sealed class RunDirectiveRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public Guid SessionId { get; set; }
+    public Guid? RunId { get; set; }
+    public Guid? MessageId { get; set; }
+    public string Kind { get; set; } = "queued_interaction";
+    public string Status { get; set; } = "pending";
+    public string PayloadJson { get; set; } = string.Empty;
+    public string? IdempotencyKey { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+    public DateTimeOffset? DrainedAt { get; set; }
 }

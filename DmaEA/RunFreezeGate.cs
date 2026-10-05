@@ -1,0 +1,115 @@
+using TinadecCore.Abstractions.Ports;
+
+namespace TinadecCore.DmaEA;
+
+/// <summary>
+/// Gate 3 of the DmaEA checker (run freeze). Runs at configuration freeze (run
+/// admission) and again at recovery after the frozen document is re-verified.
+///
+/// Rules (each fail-closed with a snake_case code on RunAdmissionException):
+/// ① conversation_identity_locked_mismatch — when the session carries a frozen
+///    ConversationIdentity, the operation roster must contain that template and
+///    it must hold the conversation capability. Sessions frozen before identity
+///    existed (null identity) keep the legacy literal-meeting semantics.
+/// ② instance_pool violations — pool members must be known roster instances and
+///    the main instance must be the conversation identity; an absent/empty pool
+///    is the tolerated legacy singleton shape.
+/// ③ topology — the frozen roster must retain an execution layer.
+/// ④ graph_tier_lanes_unsupported — declared-graph tiers do not define lane
+///    machinery (deferred lanes, gate reviews, per-lane planners) in this phase;
+///    the frozen configuration is the authority, so the combination is rejected
+///    at admission instead of failing mid-run.
+///
+/// Deliberately NOT here: tool surfaces. Template-level tool_scope entries on any
+/// layer only contribute the frozen manifest ceiling. The operation-layer tool
+/// floor that used to be enforced at dispatch time
+/// (CoreAuthorizationContextResolver's operation_layer_cannot_invoke_tools) and at
+/// publish time (ModePublishGate's operation_tool_floor_violation) was REMOVED BY
+/// DESIGN (2026-09-17) — a mode may now give its conversation identity a tool
+/// surface of its own. The surviving defences are the explicit pack declaration,
+/// the write-grant rule, and per-write human approval, none of which belong in an
+/// admission gate.
+/// </summary>
+public static class RunFreezeGate
+{
+    public sealed record ConversationIdentity(string NodeKey, string TemplateSlug);
+
+    public sealed record PoolState(Guid? IdentityInstanceId, IReadOnlyList<Guid> PoolMemberIds, Guid? MainInstanceId);
+
+    public static void Validate(
+        ConversationIdentity? identity,
+        IReadOnlyList<RuntimeAgentDefinition> operation,
+        IReadOnlyList<RuntimeAgentDefinition> execution,
+        FrozenGraph? graph = null,
+        bool lanesEnabled = false)
+    {
+        // ① conversation identity lock
+        if (identity is not null)
+        {
+            var holder = operation.FirstOrDefault(agent =>
+                string.Equals(agent.Id, identity.TemplateSlug, StringComparison.OrdinalIgnoreCase));
+            if (holder is null)
+                throw new RunAdmissionException("conversation_identity_locked_mismatch",
+                    $"Session identity '{identity.TemplateSlug}' (node '{identity.NodeKey}') is not part of the frozen operation roster.");
+            if (!holder.Capabilities.Any(capability =>
+                    string.Equals(capability, ThreeNamespaceMap.ConverseCapability, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(capability, ThreeNamespaceMap.ConverseCapabilityAlias, StringComparison.OrdinalIgnoreCase)))
+                throw new RunAdmissionException("conversation_identity_locked_mismatch",
+                    $"Conversation identity holder '{holder.Id}' does not carry a conversation capability.");
+        }
+
+        // ② topology: the frozen roster must retain an execution layer, with two
+        // exemptions that both describe a master that can operate alone. Either the
+        // graph is the free_form shape (no declared edges) and the conversation identity
+        // holds dispatchable-worker spawn authority — the single-director mode builds its
+        // execution layer at runtime from the spawnable templates frozen into the graph —
+        // or the tier is solo_dispatch, where the master has a tool surface of its own
+        // and simply does the work without any worker at all.
+        if (execution.Count == 0)
+        {
+            var soloMaster = graph is { Tier: FrozenGraphTiers.SoloDispatch };
+            var freeFormWithSpawnAuthority = graph is { Tier: FrozenGraphTiers.FreeForm }
+                && operation.FirstOrDefault(agent =>
+                    string.Equals(agent.Id, graph.ConversationTemplateSlug, StringComparison.OrdinalIgnoreCase)) is { } director
+                && director.Capabilities.Any(capability =>
+                    string.Equals(capability, ThreeNamespaceMap.SpawnTemporaryCapability, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(capability, ThreeNamespaceMap.SpawnAliasCapability, StringComparison.OrdinalIgnoreCase));
+            if (!soloMaster && !freeFormWithSpawnAuthority)
+                throw new RunAdmissionException("mode_topology_invalid",
+                    "The frozen roster has no execution-layer agent (and the mode is neither a free-form director with spawn authority nor a solo master that holds its own tools).");
+        }
+
+        // ③ lanes × declared-graph tiers — fail fast at admission (the frozen
+        // configuration is the authority; a mid-run rejection here would mean the
+        // freeze gate was bypassed).
+        if (graph is not null && lanesEnabled)
+            throw new RunAdmissionException("graph_tier_lanes_unsupported",
+                "Lane orchestration is not supported for declared-graph tiers; disable lanes in the runtime configuration or publish the mode without declared edges.");
+    }
+
+    /// <summary>
+    /// Pool-shape validation over restored checkpoints. An absent identity and an
+    /// empty pool is the tolerated legacy singleton shape; a pool without an
+    /// identity, or a main instance that is not the identity holder, is invalid.
+    /// </summary>
+    public static void ValidatePool(PoolState? pool)
+    {
+        if (pool is null) return;
+        if (pool.IdentityInstanceId is null)
+        {
+            if (pool.PoolMemberIds.Count > 0)
+                throw new RunAdmissionException("instance_pool_context_mismatch",
+                    "Checkpoint declares pool members without a conversation identity instance.");
+            return;
+        }
+        if (pool.PoolMemberIds.Count == 0)
+            throw new RunAdmissionException("instance_pool_context_mismatch",
+                "Checkpoint declares a conversation identity instance without pool members.");
+        if (pool.MainInstanceId is { } main && main != pool.IdentityInstanceId)
+            throw new RunAdmissionException("instance_pool_context_mismatch",
+                "The checkpoint main instance must be the conversation identity instance.");
+        if (pool.PoolMemberIds.Distinct().Count() != pool.PoolMemberIds.Count)
+            throw new RunAdmissionException("instance_pool_context_mismatch",
+                "Checkpoint pool contains duplicate member ids.");
+    }
+}

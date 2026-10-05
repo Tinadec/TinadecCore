@@ -1,6 +1,7 @@
 using Microsoft.Extensions.AI;
 using TinadecCore.Abstractions.Ports;
 using TinadecCore.DmaEA;
+using TinadecCore.Models.Harness;
 
 namespace TinadecCore.AgentFramework.Tests;
 
@@ -46,6 +47,27 @@ public sealed class ChatProtocolTests
         Assert.Equal(ChatProtocols.OpenAiResponses, ChatProtocols.InferFromDriver("openai-responses"));
         Assert.Equal(ChatProtocols.OpenAiChat, ChatProtocols.InferFromDriver("openai"));
         Assert.Equal(ChatProtocols.OpenAiChat, ChatProtocols.InferFromDriver(null));
+    }
+
+    /// <summary>
+    /// The two questions the resolver used to ask with one flag. Collapsing them is what broke ACP
+    /// twice over: <c>opencode serve</c> needs a URL, a stdio harness needs a binary, and treating
+    /// "the harness picks the model" as "there is an endpoint" made every stdio provider report
+    /// <c>endpoint_missing</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(ChatProtocols.Acp, true, true)]
+    [InlineData(ChatProtocols.HeadlessCli, true, true)]
+    [InlineData(ChatProtocols.Tui, true, true)]
+    [InlineData(ChatProtocols.OpencodeServe, false, true)]
+    [InlineData(ChatProtocols.OpenAiChat, false, false)]
+    [InlineData(ChatProtocols.OpenAiResponses, false, false)]
+    [InlineData(ChatProtocols.AnthropicMessages, false, false)]
+    [InlineData("grpc", false, false)]
+    public void ProtocolFlags_SeparateTransportFromWhoChoosesTheModel(string protocol, bool processTransport, bool harnessChoosesModel)
+    {
+        Assert.Equal(processTransport, ChatProtocols.IsProcessTransport(protocol));
+        Assert.Equal(harnessChoosesModel, ChatProtocols.IsModelChosenByHarness(protocol));
     }
 
     [Fact]

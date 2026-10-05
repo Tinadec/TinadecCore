@@ -22,6 +22,15 @@ public sealed class TinadecPersistenceOptions
     public string DataRoot { get; set; } = "data";
 
     /// <summary>
+    /// Which <c>ISecretStore</c> protects credential material. <c>auto</c> (default) picks
+    /// DPAPI on Windows and an AES-GCM file store on Linux/macOS. Use <c>environment</c>
+    /// when the deployment injects credentials through the process environment instead —
+    /// that store is read-only, so saving a key from the control plane fails by design.
+    /// See <see cref="SecretStoreFactory"/>.
+    /// </summary>
+    public string SecretStore { get; set; } = SecretStoreFactory.Auto;
+
+    /// <summary>
     /// SQLite applies migrations during local startup. PostgreSQL requires this explicit opt-in
     /// so a multi-instance deployment does not race schema changes.
     /// </summary>

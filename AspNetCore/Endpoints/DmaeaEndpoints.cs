@@ -8,6 +8,7 @@ using TinadecCore.DmaEA;
 using TinadecCore.Lifecycle;
 using TinadecCore.Memory;
 using TinadecCore.Runtime;
+using TinadecCore.Tools;
 
 namespace TinadecCore.AspNetCore.Endpoints;
 
@@ -22,65 +23,9 @@ public static class DmaeaEndpoints
 {
     public static IEndpointRouteBuilder MapDmaeaEndpoints(this IEndpointRouteBuilder app)
     {
-        app.MapPost("/api/v1/sessions/{sessionId}/invoke-stream", async (HttpContext context, string sessionId, InvokeStreamRequest request, IFullDuplexRunCoordinator coordinator, CancellationToken ct) =>
-        {
-            if (!Guid.TryParse(sessionId, out var sessionGuid))
-            {
-                context.Response.StatusCode = StatusCodes.Status400BadRequest;
-                await context.Response.WriteAsync("{\"code\":\"INVALID_SESSION_ID\"}", ct);
-                return;
-            }
-            if (request is null || string.IsNullOrWhiteSpace(request.Content))
-            {
-                context.Response.StatusCode = StatusCodes.Status400BadRequest;
-                await context.Response.WriteAsync("{\"code\":\"INVALID_MESSAGE\"}", ct);
-                return;
-            }
-
-            try
-            {
-                var invocationOverride = request.MeetingModelOverride is null
-                    ? null
-                    : new SessionModelOverride(request.MeetingModelOverride.ProviderInstanceId, request.MeetingModelOverride.Model);
-                var admission = await coordinator.SubmitAsync(new FullDuplexInvocation(sessionGuid, request.Content, request.ClientMessageId, request.ApplicationMode, request.AgentMode, request.PermissionMode, request.TargetRunId, request.ExpectedContextRevision, invocationOverride), ct);
-                context.Response.StatusCode = StatusCodes.Status200OK;
-                context.Response.ContentType = "text/event-stream";
-                context.Response.Headers.CacheControl = "no-cache";
-                await foreach (var chunk in coordinator.FollowAsync(admission.RunId, admission.TurnId, 0, CancellationToken.None))
-                {
-                    await WriteChunkAsync(context, chunk.Seq, new
-                    {
-                        run_id = chunk.RunId,
-                        session_id = sessionId,
-                        turn_id = chunk.TurnId,
-                        message_id = chunk.MessageId,
-                        seq = chunk.Seq,
-                        purpose = "dual_layer",
-                        kind = chunk.Kind,
-                        delta = chunk.Delta,
-                        usage = chunk.Usage,
-                        finish_reason = chunk.FinishReason,
-                        error_category = chunk.ErrorCategory,
-                        safe_error_message = chunk.SafeErrorMessage
-                    }, context.RequestAborted);
-                    await context.Response.Body.FlushAsync(context.RequestAborted);
-                }
-            }
-            catch (RunAdmissionException ex)
-            {
-                context.Response.StatusCode = ex.Code is "CONTEXT_REVISION_CONFLICT" or "ACTIVE_RUN_LIMIT" or "IDEMPOTENCY_KEY_REUSE" ? StatusCodes.Status409Conflict : StatusCodes.Status400BadRequest;
-                await context.Response.WriteAsJsonAsync(new { code = ex.Code, message = ex.Message }, ct);
-            }
-            catch (KeyNotFoundException)
-            {
-                context.Response.StatusCode = StatusCodes.Status404NotFound;
-                await context.Response.WriteAsJsonAsync(new { code = "NOT_FOUND", message = "Session was not found." }, ct);
-            }
-            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
-            {
-                // The subscriber disconnected. The coordinator continues independently.
-            }
-        });
+        // POST /sessions/{sessionId}/invoke-stream was retired (plan §4.3 item 4):
+        // the durable admission path is POST /sessions/{id}/interactions followed by
+        // GET /runs/{runId}/stream; no Desktop consumer remains on the legacy wire.
 
         app.MapGet("/api/v1/runs/{runId}/stream", async (HttpContext context, string runId, Guid? turn_id, long? after_seq, IFullDuplexRunCoordinator coordinator, CancellationToken ct) =>
         {
@@ -107,7 +52,17 @@ public static class DmaeaEndpoints
             {
                 await foreach (var chunk in coordinator.FollowAsync(runGuid, turn_id, cursor, CancellationToken.None))
                 {
-                    await WriteChunkAsync(context, chunk.Seq, new
+                    if (chunk.Kind is "heartbeat")
+                    {
+                        // Idle keep-alive as an SSE comment: never advances the
+                        // client cursor and every parser ignores it by spec.
+                        await context.Response.WriteAsync(": heartbeat\n\n", context.RequestAborted);
+                        await context.Response.Body.FlushAsync(context.RequestAborted);
+                        continue;
+                    }
+                    await WriteChunkAsync(context, chunk.Seq, chunk.Kind, chunk.OccurredAt == default
+                        ? DateTimeOffset.UtcNow
+                        : chunk.OccurredAt, new
                     {
                         run_id = chunk.RunId,
                         turn_id = chunk.TurnId,
@@ -115,6 +70,7 @@ public static class DmaeaEndpoints
                         seq = chunk.Seq,
                         purpose = "dual_layer",
                         kind = chunk.Kind,
+                        occurred_at = (chunk.OccurredAt == default ? DateTimeOffset.UtcNow : chunk.OccurredAt).ToString("o"),
                         delta = chunk.Delta,
                         usage = chunk.Usage,
                         finish_reason = chunk.FinishReason,
@@ -135,32 +91,105 @@ public static class DmaeaEndpoints
             catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { }
         });
 
-        app.MapGet("/api/v1/sessions/{sessionId}/orchestration", async (string sessionId, StorageLifecycleService lifecycle, ProjectSessionStore sessions, CancellationToken ct) =>
+        app.MapGet("/api/v1/sessions/{sessionId}/orchestration", async (string sessionId, StorageLifecycleService lifecycle, ProjectSessionStore sessions, IDbContextFactory<AgentConfigurationDbContext> cfgFactory, CancellationToken ct) =>
         {
             if (!Guid.TryParse(sessionId, out var sessionGuid)) return Results.BadRequest(new { code = "INVALID_SESSION_ID" });
             var session = await sessions.FindAsync(sessionGuid, ct);
             if (session is null) return Results.NotFound(new { code = "NOT_FOUND", message = "Session was not found." });
+
+            // Declared graph (additive-only): the published mode-version snapshot is
+            // the base layer, even before any run exists — what the UI draws is what
+            // the engine walks. Observed flows come from the durable task graph.
+            var declaredGraph = (object?)null;
+            if (session.ModeVersionId is { } modeVersionId)
+            {
+                await using var cfg = await cfgFactory.CreateDbContextAsync(ct);
+                var snapshotJson = await cfg.ModeVersions.AsNoTracking()
+                    .Where(x => x.Id == modeVersionId && x.TenantId == session.TenantId && x.WorkspaceId == session.WorkspaceId)
+                    .Select(x => x.SnapshotJson)
+                    .FirstOrDefaultAsync(ct);
+                declaredGraph = OrchestrationGraphProjection.FromSnapshot(snapshotJson);
+            }
+
             var runs = await lifecycle.ListRunsAsync(sessionGuid, ct);
             var run = runs.FirstOrDefault();
-            if (run is null) return Results.Json(new { run = (object?)null, graph = (object?)null, nodes = Array.Empty<object>(), assignments = Array.Empty<object>(), step_results = Array.Empty<object>(), context_packs = Array.Empty<object>(), supervision_findings = Array.Empty<object>() }, options: new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web) { PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.SnakeCaseLower });
+            if (run is null) return Results.Json(new { run = (object?)null, graph = declaredGraph, nodes = Array.Empty<object>(), lanes = Array.Empty<object>(), flows = Array.Empty<object>(), assignments = Array.Empty<object>(), step_results = Array.Empty<object>(), context_packs = Array.Empty<object>(), supervision_findings = Array.Empty<object>() }, options: new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web) { PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.SnakeCaseLower });
             var events = await lifecycle.ReplayEventsAsync(sessionGuid, 0, ct);
-            var nodes = events.Where(e => e.EventType == "task.assigned" || e.EventType == "step.result.created")
-                .Select(e => new
+            var checkpointRow = await lifecycle.GetCurrentRunCheckpointAsync(run.Id, ct);
+            FullDuplexCheckpointV1? checkpoint = null;
+            if (checkpointRow is not null)
+            {
+                try { checkpoint = System.Text.Json.JsonSerializer.Deserialize<FullDuplexCheckpointV1>(checkpointRow.Content, CheckpointJsonOptions); } catch { }
+            }
+            static string LaneOfTaskSession(DurableTaskNode task) =>
+                string.IsNullOrWhiteSpace(task.LaneKey) ? "main" : task.LaneKey.Trim();
+            var taskLaneById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (checkpoint is not null)
+            {
+                foreach (var task in checkpoint.Tasks)
                 {
-                    id = PayloadString(e.Payload, "task_node_id"),
-                    graph_id = PayloadString(e.Payload, "graph_id"),
-                    run_id = run.Id.ToString(),
-                    session_id = sessionId,
-                    title = PayloadString(e.Payload, "title") ?? "",
-                    description = PayloadString(e.Payload, "description") ?? "",
-                    status = e.EventType == "step.result.created" ? PayloadString(e.Payload, "status") ?? "completed" : "assigned",
-                    priority = 1,
-                    risk = "medium",
-                    success_criteria = Array.Empty<string>(),
-                    dependencies = Array.Empty<string>(),
-                    required_capabilities = Array.Empty<string>(),
-                    created_at = e.Timestamp,
-                    updated_at = e.Timestamp
+                    taskLaneById.TryAdd(task.TaskKey, LaneOfTaskSession(task));
+                    taskLaneById.TryAdd(task.TaskId.ToString(), LaneOfTaskSession(task));
+                }
+            }
+            var lanes = checkpoint is null
+                ? new List<object>()
+                : (checkpoint.Lanes.Count > 0
+                    ? checkpoint.Lanes.Select(l => (object)new
+                    {
+                        lane_key = l.LaneKey,
+                        status = l.Status,
+                        escalated = l.Escalated,
+                        task_keys = checkpoint.Tasks.Where(t => LaneOfTaskSession(t) == l.LaneKey).Select(t => t.TaskKey).ToList(),
+                        waits = checkpoint.Tasks.Where(t => LaneOfTaskSession(t) == l.LaneKey)
+                            .SelectMany(t => t.Waits.Select(w => new
+                            {
+                                waiting_task = t.TaskKey,
+                                lane = w.LaneKey,
+                                predicate = w.Predicate,
+                                required_criteria = w.RequiredCriteria,
+                                facts_hash = w.ObservedFactsHash
+                            })).ToList()
+                    }).ToList()
+                    : new List<object>
+                    {
+                        new
+                        {
+                            lane_key = "main",
+                            status = checkpoint.Phase,
+                            escalated = false,
+                            task_keys = checkpoint.Tasks.Select(t => t.TaskKey).ToList(),
+                            waits = Array.Empty<object>()
+                        }
+                    });
+            var nodes = events.Where(e => e.EventType is "task.assigned" or "step.result.created" or "worker.completed" or "worker.blocked" or "worker.failed")
+                .Select(e =>
+                {
+                    var nodeId = PayloadString(e.Payload, "task_id") ?? PayloadString(e.Payload, "task_node_id") ?? "";
+                    return new
+                    {
+                        id = nodeId,
+                        graph_id = PayloadString(e.Payload, "graph_id"),
+                        run_id = run.Id.ToString(),
+                        session_id = sessionId,
+                        title = PayloadString(e.Payload, "title") ?? "",
+                        description = PayloadString(e.Payload, "description") ?? "",
+                        status = e.EventType switch
+                        {
+                            "worker.failed" => "failed",
+                            "worker.blocked" => "blocked",
+                            "worker.completed" or "step.result.created" => PayloadString(e.Payload, "status") ?? "completed",
+                            _ => "assigned"
+                        },
+                        lane_key = taskLaneById.TryGetValue(nodeId, out var nodeLane) ? nodeLane : "main",
+                        priority = 1,
+                        risk = "medium",
+                        success_criteria = Array.Empty<string>(),
+                        dependencies = Array.Empty<string>(),
+                        required_capabilities = Array.Empty<string>(),
+                        created_at = e.Timestamp,
+                        updated_at = e.Timestamp
+                    };
                 })
                 .ToList();
             var stepResults = events.Where(e => e.EventType == "step.result.created")
@@ -188,8 +217,10 @@ public static class DmaeaEndpoints
                     created_at = run.CreatedAt,
                     updated_at = run.UpdatedAt
                 },
-                graph = (object?)null,
+                graph = declaredGraph,
                 nodes,
+                lanes,
+                flows = OrchestrationGraphProjection.FlowsFromCheckpoint(checkpoint, session.ConversationTemplateSlug),
                 assignments = Array.Empty<object>(),
                 step_results = stepResults,
                 context_packs = Array.Empty<object>(),
@@ -205,30 +236,7 @@ public static class DmaeaEndpoints
             if (!Guid.TryParse(sessionId, out var sessionGuid)) return Results.BadRequest(new { code = "INVALID_SESSION_ID" });
             if (await sessions.FindAsync(sessionGuid, ct) is null) return Results.NotFound(new { code = "NOT_FOUND", message = "Session was not found." });
             var events = await lifecycle.ReplayEventsAsync(sessionGuid, 0, ct);
-            var items = events.Where(e => e.EventType == "step.result.created" || e.EventType == "task.assigned").Select(e => new
-            {
-                id = PayloadString(e.Payload, "task_node_id"),
-                run_id = PayloadString(e.Payload, "run_id") ?? "",
-                session_id = sessionId,
-                tool_id = PayloadString(e.Payload, "tool_id") ?? "",
-                tool_display_name = "",
-                source = "dmaea",
-                provider_layer = "execution",
-                risk = "medium",
-                requires_approval = false,
-                status = e.EventType == "step.result.created" ? PayloadString(e.Payload, "status") ?? "completed" : "pending",
-                approval_id = (string?)null,
-                step_result_id = PayloadString(e.Payload, "task_node_id"),
-                summary = PayloadString(e.Payload, "summary") ?? "",
-                evidence = PayloadArray(e.Payload, "evidence"),
-                requested_at = e.Timestamp,
-                updated_at = e.Timestamp,
-                duration_ms = 0L,
-                requested_seq = e.Payload.TryGetValue("sequence", out var seq) ? (long)(seq is JsonElement je && je.ValueKind == JsonValueKind.Number ? je.GetInt64() : 0) : 0L,
-                updated_seq = 0L,
-                event_types = new[] { e.EventType },
-                checkpoint_summary = ""
-            }).ToList();
+            var items = BuildToolExecutionTimeline(events, sessionId);
             return Results.Ok(items);
         });
 
@@ -237,15 +245,21 @@ public static class DmaeaEndpoints
             if (!Guid.TryParse(sessionId, out var sessionGuid)) return Results.BadRequest(new { code = "INVALID_SESSION_ID" });
             if (await sessions.FindAsync(sessionGuid, ct) is null) return Results.NotFound(new { code = "NOT_FOUND", message = "Session was not found." });
             var events = await lifecycle.ReplayEventsAsync(sessionGuid, 0, ct);
-            var nodes = events.Where(e => e.EventType == "task.assigned" || e.EventType == "step.result.created").Select(e => new
+            var nodes = events.Where(e => e.EventType is "task.assigned" or "step.result.created" or "worker.completed" or "worker.blocked" or "worker.failed").Select(e => new
             {
-                id = PayloadString(e.Payload, "task_node_id"),
+                id = PayloadString(e.Payload, "task_id") ?? PayloadString(e.Payload, "task_node_id"),
                 graph_id = PayloadString(e.Payload, "graph_id") ?? "",
                 run_id = PayloadString(e.Payload, "run_id") ?? "",
                 session_id = sessionId,
                 title = PayloadString(e.Payload, "title") ?? "",
                 description = PayloadString(e.Payload, "description") ?? "",
-                status = e.EventType == "step.result.created" ? PayloadString(e.Payload, "status") ?? "completed" : "assigned",
+                status = e.EventType switch
+                {
+                    "worker.failed" => "failed",
+                    "worker.blocked" => "blocked",
+                    "worker.completed" or "step.result.created" => PayloadString(e.Payload, "status") ?? "completed",
+                    _ => "assigned"
+                },
                 priority = 1,
                 risk = "medium",
                 success_criteria = Array.Empty<string>(),
@@ -257,14 +271,20 @@ public static class DmaeaEndpoints
             return Results.Ok(nodes);
         });
 
-        app.MapPost("/api/v1/runs/{runId}/control", async (string runId, RunControlRequest? request, IFullDuplexRunCoordinator coordinator, CancellationToken ct) =>
+        app.MapPost("/api/v1/runs/{runId}/control", async (string runId, RunControlRequest? request, IFullDuplexRunCoordinator coordinator, ITerminalSessionControl terminalSessions, CancellationToken ct) =>
         {
             if (!Guid.TryParse(runId, out var runGuid)) return Results.BadRequest(new { code = "INVALID_RUN_ID", message = "Run id must be a valid Guid." });
             if (request is null || string.IsNullOrWhiteSpace(request.Action)) return Results.BadRequest(new { code = "INVALID_RUN_CONTROL", message = "Action is required." });
             try
             {
                 var result = await coordinator.ControlAsync(runGuid, new RunControlCommand(request.Action, request.ClientControlId, request.ExpectedContextRevision), ct);
-                return Results.Ok(new { run_id = result.RunId, status = result.Status, action = result.Action, accepted = result.Accepted });
+                // A cancelled run must not leave long-lived terminal processes behind.
+                var killedSessions = 0;
+                if (string.Equals(request.Action, "cancel", StringComparison.OrdinalIgnoreCase) && result.Accepted)
+                {
+                    killedSessions = await terminalSessions.KillForRunAsync(runGuid, ct).ConfigureAwait(false);
+                }
+                return Results.Ok(new { run_id = result.RunId, status = result.Status, action = result.Action, accepted = result.Accepted, killed_terminal_sessions = killedSessions });
             }
             catch (RunAdmissionException ex)
             {
@@ -280,35 +300,140 @@ public static class DmaeaEndpoints
             }
         });
 
-        app.MapGet("/api/v1/runs/{runId}/orchestration", async (string runId, StorageLifecycleService lifecycle, IAgentInstanceService instances, ILifecycleManager manager, CancellationToken ct) =>
+        app.MapGet("/api/v1/runs/{runId}/orchestration", async (string runId, StorageLifecycleService lifecycle, IAgentInstanceService instances, ILifecycleManager manager, IDbContextFactory<AgentConfigurationDbContext> agentConfigFactory, ProjectSessionStore sessionStore, CancellationToken ct) =>
         {
             if (!Guid.TryParse(runId, out var runGuid)) return Results.BadRequest(new { code = "INVALID_RUN_ID", message = "Run id must be a valid Guid." });
             var run = await lifecycle.FindRunAsync(runGuid, ct);
             if (run is null) return Results.NotFound(new { code = "NOT_FOUND", message = "Run was not found." });
+
+            // Declared graph + observed flows (additive-only): the session's
+            // published mode-version snapshot is the base layer; flows come from
+            // the durable task graph, the same source /replay rebuilds from. The
+            // tier comes from the run's frozen graph section (schema v2 freezes
+            // one for every mode).
             var frozen = await manager.GetFrozenRunConfigurationAsync(runGuid.ToString(), ct);
             FrozenRunConfigurationV1? parsedFrozen = null;
             if (frozen is not null)
             {
-                try { parsedFrozen = System.Text.Json.JsonSerializer.Deserialize<FrozenRunConfigurationV1>(frozen.Content); } catch { }
+                try { parsedFrozen = System.Text.Json.JsonSerializer.Deserialize<FrozenRunConfigurationV1>(frozen.Content, CheckpointJsonOptions); } catch { }
+            }
+
+            var declaredGraph = (object?)null;
+            string? conversationTemplateSlug = null;
+            if (await sessionStore.FindAsync(run.SessionId, ct) is { } orchestrationSession)
+            {
+                conversationTemplateSlug = orchestrationSession.ConversationTemplateSlug;
+                if (orchestrationSession.ModeVersionId is { } modeVersionId)
+                {
+                    await using var graphCfg = await agentConfigFactory.CreateDbContextAsync(ct);
+                    var snapshotJson = await graphCfg.ModeVersions.AsNoTracking()
+                        .Where(x => x.Id == modeVersionId && x.TenantId == orchestrationSession.TenantId && x.WorkspaceId == orchestrationSession.WorkspaceId)
+                        .Select(x => x.SnapshotJson)
+                        .FirstOrDefaultAsync(ct);
+                    declaredGraph = OrchestrationGraphProjection.FromSnapshot(snapshotJson, parsedFrozen?.Graph?.Tier);
+                }
+            }
+            var checkpointRow = await lifecycle.GetCurrentRunCheckpointAsync(runGuid, ct);
+            FullDuplexCheckpointV1? checkpoint = null;
+            if (checkpointRow is not null)
+            {
+                try { checkpoint = System.Text.Json.JsonSerializer.Deserialize<FullDuplexCheckpointV1>(checkpointRow.Content, CheckpointJsonOptions); } catch { }
+            }
+            static string LaneOfTask(DurableTaskNode task) =>
+                string.IsNullOrWhiteSpace(task.LaneKey) ? "main" : task.LaneKey.Trim();
+            var taskLaneById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (checkpoint is not null)
+            {
+                foreach (var task in checkpoint.Tasks)
+                {
+                    taskLaneById.TryAdd(task.TaskKey, LaneOfTask(task));
+                    taskLaneById.TryAdd(task.TaskId.ToString(), LaneOfTask(task));
+                }
             }
             var events = (await lifecycle.ReplayEventsAsync(run.SessionId, 0, ct)).Where(e => e.RunId == runGuid.ToString()).ToList();
-            var nodes = events.Where(e => e.EventType is "task.dispatched" or "task.assigned" or "worker.completed" or "worker.failed" or "step.result.created").Select(e => new
+            // Agent display names for the run's instances (plan 配置体验改造 B)：
+            // 前端不再显示 role/slug/GUID 兜底。
+            var agentInstanceRows = await instances.ListByRunAsync(runGuid, ct);
+            Guid[] instanceDefinitionIds = agentInstanceRows.Select(a => a.AgentDefinitionId).Distinct().ToArray();
+            Dictionary<Guid, string> agentDisplayNames;
+            if (instanceDefinitionIds.Length > 0)
             {
-                id = PayloadString(e.Payload, "task_id") ?? PayloadString(e.Payload, "task_node_id"),
-                graph_id = PayloadString(e.Payload, "graph_id") ?? "",
-                run_id = runGuid.ToString(),
-                session_id = run.SessionId.ToString(),
-                title = PayloadString(e.Payload, "title") ?? "",
-                description = PayloadString(e.Payload, "description") ?? "",
-                status = e.EventType is "worker.completed" or "step.result.created" ? PayloadString(e.Payload, "status") ?? "completed" : e.EventType is "worker.failed" ? "failed" : "assigned",
-                priority = 1,
-                risk = PayloadString(e.Payload, "risk") ?? "medium",
-                success_criteria = Array.Empty<string>(),
-                dependencies = PayloadArray(e.Payload, "dependencies"),
-                required_capabilities = Array.Empty<string>(),
-                created_at = e.Timestamp,
-                updated_at = e.Timestamp
+                await using var agentCfg = await agentConfigFactory.CreateDbContextAsync(ct);
+                var nameRows = await agentCfg.AgentDefinitions.AsNoTracking()
+                    .Where(x => instanceDefinitionIds.Contains(x.Id))
+                    .Select(x => new { x.Id, x.DisplayName })
+                    .ToListAsync(ct);
+                agentDisplayNames = nameRows.ToDictionary(x => x.Id, x => x.DisplayName);
+            }
+            else agentDisplayNames = new Dictionary<Guid, string>();
+            string DisplayNameFor(RuntimeAgentInstance a) =>
+                agentDisplayNames.TryGetValue(a.AgentDefinitionId, out var name) && !string.IsNullOrWhiteSpace(name)
+                    ? name
+                    : a.Role;
+            var instanceNameById = agentInstanceRows.ToDictionary(a => a.Id, DisplayNameFor);
+            var nodeAgentNames = agentInstanceRows.Where(a => a.TaskId is not null)
+                .GroupBy(a => a.TaskId!.Value)
+                .ToDictionary(g => g.Key, g => DisplayNameFor(g.First()));
+            var nodes = events.Where(e => e.EventType is "task.dispatched" or "task.assigned" or "worker.completed" or "worker.blocked" or "worker.failed" or "step.result.created").Select(e =>
+            {
+                var nodeId = PayloadString(e.Payload, "task_id") ?? PayloadString(e.Payload, "task_node_id") ?? "";
+                var nodeAgentName = Guid.TryParse(nodeId, out var nodeGuid) && nodeAgentNames.TryGetValue(nodeGuid, out var dn) ? dn : null;
+                return new
+                {
+                    id = nodeId,
+                    graph_id = PayloadString(e.Payload, "graph_id") ?? "",
+                    run_id = runGuid.ToString(),
+                    session_id = run.SessionId.ToString(),
+                    title = PayloadString(e.Payload, "title") ?? "",
+                    description = PayloadString(e.Payload, "description") ?? "",
+                    status = e.EventType switch
+                    {
+                        "worker.failed" => "failed",
+                        "worker.blocked" => "blocked",
+                        "worker.completed" or "step.result.created" => PayloadString(e.Payload, "status") ?? "completed",
+                        _ => "assigned"
+                    },
+                    lane_key = taskLaneById.TryGetValue(nodeId, out var nodeLane) ? nodeLane : "main",
+                    agent_display_name = nodeAgentName,
+                    priority = 1,
+                    risk = PayloadString(e.Payload, "risk") ?? "medium",
+                    success_criteria = Array.Empty<string>(),
+                    dependencies = PayloadArray(e.Payload, "dependencies"),
+                    required_capabilities = Array.Empty<string>(),
+                    created_at = e.Timestamp,
+                    updated_at = e.Timestamp
+                };
             }).ToList();
+            var lanes = checkpoint is null
+                ? new List<object>()
+                : (checkpoint.Lanes.Count > 0
+                    ? checkpoint.Lanes.Select(l => (object)new
+                    {
+                        lane_key = l.LaneKey,
+                        status = l.Status,
+                        escalated = l.Escalated,
+                        task_keys = checkpoint.Tasks.Where(t => LaneOfTask(t) == l.LaneKey).Select(t => t.TaskKey).ToList(),
+                        waits = checkpoint.Tasks.Where(t => LaneOfTask(t) == l.LaneKey)
+                            .SelectMany(t => t.Waits.Select(w => new
+                            {
+                                waiting_task = t.TaskKey,
+                                lane = w.LaneKey,
+                                predicate = w.Predicate,
+                                required_criteria = w.RequiredCriteria,
+                                facts_hash = w.ObservedFactsHash
+                            })).ToList()
+                    }).ToList()
+                    : new List<object>
+                    {
+                        new
+                        {
+                            lane_key = "main",
+                            status = checkpoint.Phase,
+                            escalated = false,
+                            task_keys = checkpoint.Tasks.Select(t => t.TaskKey).ToList(),
+                            waits = Array.Empty<object>()
+                        }
+                    });
             var stepResults = events.Where(e => e.EventType is "worker.completed" or "worker.failed" or "step.result.created").Select(e => new
             {
                 id = PayloadString(e.Payload, "task_id") ?? PayloadString(e.Payload, "task_node_id"),
@@ -326,10 +451,18 @@ public static class DmaeaEndpoints
                 run_id = runGuid.ToString(),
                 decision = PayloadString(e.Payload, "decision"),
                 revision_round = PayloadInt(e.Payload, "revision_round") ?? 0,
-                reason = PayloadString(e.Payload, "reason"),
+                reasons = PayloadArray(e.Payload, "reasons"),
                 created_at = e.Timestamp
             }).ToList();
-            var agentInstances = (await instances.ListByRunAsync(runGuid, ct)).Select(a => new
+            var assignments = agentInstanceRows.Where(a => a.TaskId is not null).Select(a => new
+            {
+                task_node_id = a.TaskId!.Value,
+                agent_instance_id = a.Id,
+                agent_display_name = DisplayNameFor(a),
+                role = a.Role,
+                status = a.Status
+            }).ToList();
+            var agentInstancesProjection = agentInstanceRows.Select(a => new
             {
                 id = a.Id,
                 run_id = a.RunId,
@@ -337,6 +470,7 @@ public static class DmaeaEndpoints
                 task_id = a.TaskId,
                 layer = a.Layer,
                 role = a.Role,
+                agent_display_name = DisplayNameFor(a),
                 generation_depth = a.GenerationDepth,
                 generated = a.Generated,
                 status = a.Status,
@@ -354,10 +488,8 @@ public static class DmaeaEndpoints
                     user_message_id = run.TriggerMessageId.ToString(),
                     turn_id = run.TurnId?.ToString(),
                     status = run.Status,
-                    application_mode = run.ApplicationMode,
-                    agent_mode = run.AgentMode,
                     runtime_profile_id = run.RuntimeProfileId,
-                    mode_id = parsedFrozen?.ApplicationMode ?? run.ApplicationMode,
+                    mode_version_id = parsedFrozen?.ModeVersionId,
                     config_version = run.ConfigurationVersion,
                     config_hash = run.FrozenConfigurationHash ?? run.ConfigurationHash,
                     context_revision = run.ContextRevision,
@@ -370,10 +502,8 @@ public static class DmaeaEndpoints
                     schema_version = parsedFrozen.SchemaVersion,
                     baseline_hash = parsedFrozen.BaselineHash,
                     baseline_version = parsedFrozen.BaselineVersion,
-                    application_mode = parsedFrozen.ApplicationMode,
-                    agent_mode = parsedFrozen.AgentMode,
                     runtime_profile_id = parsedFrozen.RuntimeProfileId,
-                    mode_id = parsedFrozen.ApplicationMode,
+                    mode_version_id = parsedFrozen.ModeVersionId,
                     permission_mode = parsedFrozen.PermissionMode,
                     config_version = parsedFrozen.BaselineVersion,
                     config_hash = parsedFrozen.ContentHash,
@@ -381,20 +511,25 @@ public static class DmaeaEndpoints
                     tool_manifest_protocol_version = parsedFrozen.ToolManifestProtocolVersion,
                     bindings = parsedFrozen.Bindings
                 },
-                graph = (object?)null,
+                graph = declaredGraph,
                 nodes,
-                assignments = Array.Empty<object>(),
+                lanes,
+                flows = OrchestrationGraphProjection.FlowsFromCheckpoint(checkpoint, conversationTemplateSlug),
+                assignments,
                 step_results = stepResults,
-                agent_instances = agentInstances,
+                agent_instances = agentInstancesProjection,
                 supervision_findings = supervision,
                 context_packs = events.Where(e => e.EventType == "context.packed").Select(e => new
                 {
                     id = e.EventId,
                     run_id = runGuid.ToString(),
+                    lane_key = PayloadString(e.Payload, "lane_key"),
                     evidence_count = PayloadInt(e.Payload, "evidence_count") ?? 0,
                     estimated_tokens = PayloadInt(e.Payload, "estimated_tokens") ?? 0,
                     token_budget = PayloadInt(e.Payload, "token_budget") ?? 0,
                     sources = PayloadArray(e.Payload, "sources"),
+                    source_tokens = PayloadShares(e.Payload, "source_tokens"),
+                    dropped_sources = PayloadShares(e.Payload, "dropped_sources"),
                     created_at = e.Timestamp
                 }).ToList()
             }, Options);
@@ -488,12 +623,24 @@ public static class DmaeaEndpoints
         return app;
     }
 
-    private static async Task WriteChunkAsync(HttpContext context, long sequence, object chunk, CancellationToken ct)
+    private static async Task WriteChunkAsync(HttpContext context, long sequence, string kind, DateTimeOffset occurredAt, object chunk, CancellationToken ct)
     {
-        await context.Response.WriteAsync($"id: {sequence}\ndata: {JsonSerializer.Serialize(chunk)}\n\n", ct);
+        // Envelope contract (plan §4.3 item 2): the SSE event: line carries the
+        // kind, occurred_at is the durable journal timestamp, and id === seq.
+        await context.Response.WriteAsync($"id: {sequence}\nevent: {kind}\ndata: {JsonSerializer.Serialize(chunk)}\n\n", ct);
     }
 
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+
+    /// <summary>
+    /// Checkpoint and frozen-configuration bodies are persisted by the engine
+    /// with web (camelCase) options, while the coordinator's admission-time
+    /// checkpoint write uses bare defaults; web deserialization is
+    /// case-insensitive and reads both shapes. A bare (case-sensitive) read
+    /// silently dropped every camelCase property, which emptied the
+    /// lanes/task_keys projection.
+    /// </summary>
+    private static readonly JsonSerializerOptions CheckpointJsonOptions = new(JsonSerializerDefaults.Web);
 
     private static JsonElement PayloadRoot(IReadOnlyDictionary<string, object?> payload)
     {
@@ -516,11 +663,241 @@ public static class DmaeaEndpoints
         return [];
     }
 
+    /// <summary>
+    /// Reads the <c>[{ source, tokens }]</c> rows written by <c>BudgetShares</c>, dropping a row whose
+    /// shape does not match rather than guessing a price for it.
+    /// <para>
+    /// A malformed row would otherwise reach the surface as <c>NaN</c> or <c>undefined</c>, which is how
+    /// the compression-ratio bug in this very panel read as a measurement of zero.
+    /// </para>
+    /// <para>
+    /// An event from before these keys existed yields an empty list, which the wire cannot tell apart
+    /// from "nothing was priced" — an absent key and an empty array are the same bytes once this host
+    /// serialises them. The reader distinguishes the two by pairing against <c>sources</c>: a pack that
+    /// names its evidence but carries no rows has no price data, while an empty list beside a priced
+    /// pack is the real answer that nothing was crowded out.
+    /// </para>
+    /// </summary>
+    private static IReadOnlyList<object> PayloadShares(IReadOnlyDictionary<string, object?> payload, string key)
+    {
+        var root = PayloadRoot(payload);
+        if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty(key, out var value) || value.ValueKind != JsonValueKind.Array)
+            return [];
+
+        var shares = new List<object>();
+        foreach (var item in value.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object) continue;
+            if (!item.TryGetProperty("source", out var source) || source.ValueKind != JsonValueKind.String) continue;
+            if (!item.TryGetProperty("tokens", out var tokens) || tokens.ValueKind != JsonValueKind.Number || !tokens.TryGetInt32(out var price)) continue;
+            shares.Add(new { source = source.GetString(), tokens = price });
+        }
+        return shares;
+    }
+
     private static int? PayloadInt(IReadOnlyDictionary<string, object?> payload, string key)
     {
         var root = PayloadRoot(payload);
         if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var value))
             return value;
         return null;
+    }
+
+    private static bool? PayloadBool(IReadOnlyDictionary<string, object?> payload, string key)
+    {
+        var root = PayloadRoot(payload);
+        if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty(key, out var v) && v.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            return v.GetBoolean();
+        return null;
+    }
+
+    private static IReadOnlyList<object> BuildToolExecutionTimeline(
+        IReadOnlyList<TinadecCore.Contracts.Events.EventEnvelope> events,
+        string sessionId)
+    {
+        var relevant = events.Where(e => e.EventType is "step.result.created" or "task.assigned"
+                or "tool.execution.requested" or "tool.execution.completed"
+                or "tool.execution.failed" or "tool.execution.outcome_unknown"
+                or "approval.requested" or "approval.decided" or "governance.permission_decided")
+            .ToList();
+
+        // A policy-level permission decision may only carry permission_request_id.
+        // approval.requested is the durable bridge from that request to the concrete
+        // tool execution, so build the correlation once before folding the timeline.
+        var executionByPermission = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in relevant.Where(e => e.EventType == "approval.requested"))
+        {
+            var executionId = PayloadString(e.Payload, "execution_id");
+            var permissionId = PayloadString(e.Payload, "permission_request_id");
+            if (!string.IsNullOrWhiteSpace(executionId) && !string.IsNullOrWhiteSpace(permissionId))
+                executionByPermission[permissionId] = executionId;
+        }
+
+        var toolRows = new Dictionary<string, ToolTimelineAccumulator>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in relevant.Where(e => e.EventType is not ("step.result.created" or "task.assigned")))
+        {
+            var executionId = PayloadString(e.Payload, "execution_id");
+            if (string.IsNullOrWhiteSpace(executionId) && e.EventType == "governance.permission_decided")
+            {
+                var permissionId = PayloadString(e.Payload, "permission_request_id");
+                if (!string.IsNullOrWhiteSpace(permissionId)) executionByPermission.TryGetValue(permissionId, out executionId);
+            }
+            if (string.IsNullOrWhiteSpace(executionId)) continue;
+
+            if (!toolRows.TryGetValue(executionId, out var row))
+            {
+                row = new ToolTimelineAccumulator
+                {
+                    Id = executionId,
+                    RunId = e.RunId ?? string.Empty,
+                    RequestedAt = e.Timestamp,
+                    UpdatedAt = e.Timestamp,
+                    RequestedSeq = EventSequence(e.Payload),
+                    UpdatedSeq = EventSequence(e.Payload)
+                };
+                toolRows.Add(executionId, row);
+            }
+
+            row.RunId = string.IsNullOrWhiteSpace(e.RunId) ? row.RunId : e.RunId;
+            row.ToolId = PayloadString(e.Payload, "tool_id") ?? row.ToolId;
+            row.Risk = PayloadString(e.Payload, "risk") ?? row.Risk;
+            row.RequiresApproval = row.RequiresApproval
+                || PayloadBool(e.Payload, "requires_approval") == true
+                || e.EventType is "approval.requested" or "approval.decided" or "governance.permission_decided";
+
+            var approvalId = PayloadString(e.Payload, "approval_id");
+            if (e.EventType == "approval.requested" && !string.IsNullOrWhiteSpace(approvalId)) row.ApprovalId = approvalId;
+            else if (string.IsNullOrWhiteSpace(row.ApprovalId))
+                row.ApprovalId = approvalId ?? PayloadString(e.Payload, "permission_request_id");
+
+            var summary = EventSummary(e.Payload);
+            if (!string.IsNullOrWhiteSpace(summary)) row.Summary = summary;
+            var toolSuccess = PayloadBool(e.Payload, "tool_success");
+            if (toolSuccess is not null) row.ToolSuccess = toolSuccess;
+
+            row.Status = e.EventType switch
+            {
+                "tool.execution.requested" => "requested",
+                "approval.requested" => "waiting_approval",
+                "approval.decided" => string.Equals(PayloadString(e.Payload, "decision"), "approved", StringComparison.OrdinalIgnoreCase)
+                    ? "running"
+                    : "failed",
+                "governance.permission_decided" => string.Equals(PayloadString(e.Payload, "outcome"), "allowed", StringComparison.OrdinalIgnoreCase)
+                    ? "running"
+                    : "failed",
+                "tool.execution.completed" => "completed",
+                "tool.execution.failed" => "failed",
+                "tool.execution.outcome_unknown" => "outcome_unknown",
+                _ => row.Status
+            };
+
+            if (!row.EventTypes.Contains(e.EventType, StringComparer.Ordinal)) row.EventTypes.Add(e.EventType);
+            var sequence = EventSequence(e.Payload);
+            if (sequence > 0 && (row.RequestedSeq <= 0 || sequence < row.RequestedSeq)) row.RequestedSeq = sequence;
+            if (sequence > row.UpdatedSeq) row.UpdatedSeq = sequence;
+            if (e.Timestamp < row.RequestedAt) row.RequestedAt = e.Timestamp;
+            if (e.Timestamp > row.UpdatedAt) row.UpdatedAt = e.Timestamp;
+        }
+
+        var projected = new List<(long Sequence, object Item)>();
+        foreach (var e in relevant.Where(e => e.EventType is "step.result.created" or "task.assigned"))
+        {
+            var sequence = EventSequence(e.Payload);
+            projected.Add((sequence, new
+            {
+                id = PayloadString(e.Payload, "task_node_id"),
+                run_id = PayloadString(e.Payload, "run_id") ?? string.Empty,
+                session_id = sessionId,
+                tool_id = PayloadString(e.Payload, "tool_id") ?? string.Empty,
+                tool_display_name = string.Empty,
+                source = "dmaea",
+                provider_layer = "execution",
+                risk = "medium",
+                requires_approval = false,
+                status = e.EventType == "step.result.created" ? PayloadString(e.Payload, "status") ?? "completed" : "pending",
+                approval_id = (string?)null,
+                step_result_id = PayloadString(e.Payload, "task_node_id"),
+                summary = PayloadString(e.Payload, "summary") ?? string.Empty,
+                evidence = PayloadArray(e.Payload, "evidence"),
+                requested_at = e.Timestamp,
+                updated_at = e.Timestamp,
+                duration_ms = 0L,
+                requested_seq = sequence,
+                updated_seq = sequence,
+                event_types = new[] { e.EventType },
+                checkpoint_summary = string.Empty,
+                tool_success = (bool?)null
+            }));
+        }
+
+        foreach (var row in toolRows.Values)
+        {
+            projected.Add((row.RequestedSeq, new
+            {
+                id = row.Id,
+                run_id = row.RunId,
+                session_id = sessionId,
+                tool_id = row.ToolId,
+                tool_display_name = string.Empty,
+                source = "dmaea",
+                provider_layer = "execution",
+                risk = row.Risk,
+                requires_approval = row.RequiresApproval,
+                status = row.Status,
+                approval_id = row.ApprovalId,
+                step_result_id = (string?)null,
+                summary = row.Summary,
+                evidence = Array.Empty<string>(),
+                requested_at = row.RequestedAt,
+                updated_at = row.UpdatedAt,
+                duration_ms = Math.Max(0L, (long)(row.UpdatedAt - row.RequestedAt).TotalMilliseconds),
+                requested_seq = row.RequestedSeq,
+                updated_seq = row.UpdatedSeq,
+                event_types = row.EventTypes.ToArray(),
+                checkpoint_summary = string.Empty,
+                tool_success = row.ToolSuccess
+            }));
+        }
+
+        return projected.OrderBy(item => item.Sequence).Select(item => item.Item).ToList();
+    }
+
+    private static long EventSequence(IReadOnlyDictionary<string, object?> payload)
+    {
+        if (payload.TryGetValue("sequence", out var value))
+        {
+            if (value is long l) return l;
+            if (value is int i) return i;
+            if (value is JsonElement { ValueKind: JsonValueKind.Number } json && json.TryGetInt64(out var parsed)) return parsed;
+        }
+        return 0L;
+    }
+
+    private static string EventSummary(IReadOnlyDictionary<string, object?> payload) =>
+        payload.TryGetValue("summary", out var value)
+            ? value switch
+            {
+                string text => text,
+                JsonElement { ValueKind: JsonValueKind.String } json => json.GetString() ?? string.Empty,
+                _ => string.Empty
+            }
+            : string.Empty;
+
+    private sealed class ToolTimelineAccumulator
+    {
+        public string Id { get; init; } = string.Empty;
+        public string RunId { get; set; } = string.Empty;
+        public string ToolId { get; set; } = string.Empty;
+        public string Risk { get; set; } = "medium";
+        public bool RequiresApproval { get; set; }
+        public string Status { get; set; } = "requested";
+        public string? ApprovalId { get; set; }
+        public string Summary { get; set; } = string.Empty;
+        public bool? ToolSuccess { get; set; }
+        public DateTimeOffset RequestedAt { get; set; }
+        public DateTimeOffset UpdatedAt { get; set; }
+        public long RequestedSeq { get; set; }
+        public long UpdatedSeq { get; set; }
+        public List<string> EventTypes { get; } = [];
     }
 }

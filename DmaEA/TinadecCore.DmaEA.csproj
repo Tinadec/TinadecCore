@@ -15,11 +15,13 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Agents.AI" />
     <PackageReference Include="Microsoft.Agents.AI.Abstractions" />
-    <PackageReference Include="Microsoft.Agents.AI.Workflows" />
     <PackageReference Include="Microsoft.Agents.AI.OpenAI" />
     <PackageReference Include="Microsoft.Extensions.AI" />
-    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" />
-    <PackageReference Include="Anthropic.SDK" />
+    <!--
+      Anthropic.SDK and Microsoft.Extensions.AI.OpenAI left with the protocol-aware chat client factory
+      and the harness transports: the wire-protocol choice belongs to the model-interface module. What
+      stays here is the agent runtime and MAF itself, so no DmaEA file names a provider SDK anymore.
+    -->
     <PackageReference Include="Microsoft.EntityFrameworkCore" />
     <PackageReference Include="Tomlyn" />
   </ItemGroup>
@@ -31,6 +33,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="TinadecCore.Api.Tests" />
     <InternalsVisibleTo Include="TinadecCore.AgentFramework.Tests" />
+    <InternalsVisibleTo Include="TinadecCore.AspNetCore" />
   </ItemGroup>
 
 </Project>

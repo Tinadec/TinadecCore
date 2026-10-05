@@ -178,7 +178,28 @@ public sealed record FrozenPolicySnapshot(
 /// </summary>
 public sealed record AuthorizationBoundary(
     string Name,
-    IReadOnlyList<CapabilityRule> Rules);
+    IReadOnlyList<CapabilityRule> Rules)
+{
+    /// <summary>
+    /// Actionable reason for a deny produced by this boundary. It is diagnostic,
+    /// not policy material: it is excluded from the boundary hash and only replaces
+    /// the generic "boundary explicitly denies" text, so an operator or a model can
+    /// see what was missing (which workspace root, which level, which grants).
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? DenyReason { get; init; }
+
+    /// <summary>
+    /// Actionable reason for a decision that clears this boundary but only behind an
+    /// approval: the level is missing from the frozen envelope, so the call must be
+    /// decided by a human instead of being refused. Like <see cref="DenyReason"/> it
+    /// is diagnostic rather than policy material, and it is likewise excluded from
+    /// the boundary hash so adding it cannot invalidate an admitted run's policy
+    /// snapshot.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? UpgradeReason { get; init; }
+}
 
 public sealed record CreatePolicyBundleCommand(
     string Slug,
@@ -285,7 +306,11 @@ public sealed record PermissionRequestCommand(
     string Risk,
     decimal ExpectedCost,
     string Rationale,
-    string IdempotencyKey);
+    string IdempotencyKey,
+    string? PermissionMode = null,
+    CapabilityClaim? ResourceClaim = null,
+    /// <summary>See <see cref="ToolAuthorizationCommand.CommandRuleId"/>; travels with the request.</summary>
+    Guid? CommandRuleId = null);
 
 public sealed record PermissionRequestSnapshot(
     Guid Id,
@@ -386,6 +411,13 @@ public sealed record LeaseConsumptionResult(
     CapabilityLeaseSnapshot? Lease,
     AuthorizationDecisionSnapshot Decision);
 
+/// <summary>
+/// Boundary-resolution request. <c>ResourceClaim</c> is the WS-8 optional
+/// resource dimension: the concrete workspace target the claim acts on
+/// (<c>resource.access</c> / <c>path://&lt;workspace-relative&gt;</c>). Absent
+/// means "no path dimension" — the resource boundary then decides on the
+/// read/write level alone, exactly as before.
+/// </summary>
 public sealed record AuthorizationContextRequest(
     Guid TenantId,
     Guid WorkspaceId,
@@ -393,7 +425,8 @@ public sealed record AuthorizationContextRequest(
     Guid? SubjectAgentInstanceId,
     CapabilityClaim Claim,
     Guid? RunId,
-    Guid? TaskId);
+    Guid? TaskId,
+    CapabilityClaim? ResourceClaim = null);
 
 public sealed record ToolAuthorizationCommand(
     Guid SubjectPrincipalId,
@@ -406,7 +439,14 @@ public sealed record ToolAuthorizationCommand(
     int RequestedUses,
     TimeSpan RequestedDuration,
     string Rationale,
-    string IdempotencyKey);
+    string IdempotencyKey,
+    string? PermissionMode = null,
+    CapabilityClaim? ResourceClaim = null,
+    /// <summary>
+    /// A standing command-prefix rule (todo E7) the engine itself matched against this call's
+    /// command. Hint only: the PDP re-verifies scope, kind and tool before honoring it.
+    /// </summary>
+    Guid? CommandRuleId = null);
 
 /// <summary>Publicly safe result for tool authorization; lease nonce is never returned.</summary>
 public sealed record ToolAuthorizationResult(

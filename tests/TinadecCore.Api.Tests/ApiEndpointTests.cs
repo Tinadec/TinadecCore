@@ -4,6 +4,9 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using TinadecCore.Abstractions.Ports;
+using TinadecCore.Contracts.Dtos;
 
 namespace TinadecCore.Api.Tests;
 
@@ -83,8 +86,10 @@ public sealed class ApiEndpointTests : IClassFixture<ApiEndpointFactory>
 
         // modules include the explicit Governance policy-decision module.
         Assert.True(root.TryGetProperty("modules", out var modules));
-        Assert.Equal(13, modules.GetArrayLength());
+        Assert.Equal(15, modules.GetArrayLength());
+        Assert.Contains(modules.EnumerateArray(), module => module.GetProperty("module_id").GetString() == "tina_chat");
         Assert.Contains(modules.EnumerateArray(), module => module.GetProperty("module_id").GetString() == "governance");
+        Assert.Contains(modules.EnumerateArray(), module => module.GetProperty("module_id").GetString() == "agent_graph");
 
         // design_notes
         Assert.True(root.TryGetProperty("design_notes", out _));
@@ -126,40 +131,49 @@ public sealed class ApiEndpointTests : IClassFixture<ApiEndpointFactory>
         using var doc = JsonDocument.Parse(content);
         var root = doc.RootElement;
 
-        // Framework ready
-        Assert.True(root.TryGetProperty("framework_ready", out var fwReady));
-        Assert.True(fwReady.GetBoolean());
-
-        Assert.True(root.TryGetProperty("framework_name", out var fwName));
-        Assert.Equal("Microsoft Agent Framework", fwName.GetString());
-
-        Assert.True(root.TryGetProperty("framework_version", out var fwVersion));
-        Assert.Equal("1.18.0", fwVersion.GetString());
-
-        // Status should be "warning" because some modules are not_configured
+        // Unified receipt contract: overall ready|degraded|blocked + fixed items.
         Assert.True(root.TryGetProperty("status", out var status));
-        Assert.Equal("warning", status.GetString());
+        Assert.Contains(status.GetString(), new[] { "ready", "degraded", "blocked" });
+        Assert.True(root.TryGetProperty("checked_at", out _));
 
-        // Storage receipt (shared database abstraction)
-        Assert.True(root.TryGetProperty("storage", out var storage));
-        Assert.True(storage.TryGetProperty("provider", out var storageProvider));
-        Assert.Equal("sqlite", storageProvider.GetString());
-        Assert.True(storage.TryGetProperty("state", out var storageState));
-        Assert.Equal("ready", storageState.GetString());
-
-        // Modules
-        Assert.True(root.TryGetProperty("modules", out var modules));
-        var moduleList = modules.EnumerateArray().ToList();
-        Assert.Equal(13, moduleList.Count);
-
-        // At least some modules should be "not_configured"
-        var notConfiguredCount = moduleList.Count(m =>
+        Assert.True(root.TryGetProperty("items", out var items));
+        var itemList = items.EnumerateArray().ToList();
+        var expectedIds = new[]
         {
-            return m.TryGetProperty("module_state", out var state) &&
-                   state.GetString() == "not_configured";
+            "database", "core_storage", "agent_pack", "default_mode", "model_provider",
+            "model_secret", "model_route", "model_probe", "tool_provider", "manifest_hash"
+        };
+        var ids = itemList.Select(item => item.GetProperty("id").GetString()).ToHashSet();
+        foreach (var expectedId in expectedIds)
+        {
+            Assert.True(ids.Contains(expectedId), $"readiness receipt is missing item '{expectedId}'");
+        }
+
+        // Every item carries status and a timestamp; reason/action are omitted
+        // when null (ready items carry no remediation hint).
+        foreach (var item in itemList)
+        {
+            Assert.True(item.TryGetProperty("status", out _));
+            Assert.True(item.TryGetProperty("checked_at", out _));
+        }
+
+        var database = itemList.Single(item => item.GetProperty("id").GetString() == "database");
+        Assert.Equal("ready", database.GetProperty("status").GetString());
+        var coreStorage = itemList.Single(item => item.GetProperty("id").GetString() == "core_storage");
+        Assert.Equal("ready", coreStorage.GetProperty("status").GetString());
+
+        // Module registration facts stay on the harness manifest.
+        var manifestResponse = await client.GetAsync("/api/v1/harness/manifest");
+        manifestResponse.EnsureSuccessStatusCode();
+        await using var manifestStream = await manifestResponse.Content.ReadAsStreamAsync();
+        using var manifestDoc = await JsonDocument.ParseAsync(manifestStream);
+        var modules = manifestDoc.RootElement.GetProperty("modules").EnumerateArray().ToList();
+        Assert.Equal(15, modules.Count);
+        Assert.All(modules, m =>
+        {
+            Assert.True(m.TryGetProperty("registration_status", out var state));
+            Assert.Contains(state.GetString() ?? "", new[] { "registered", "notconfigured", "not_configured", "disabled" });
         });
-        Assert.True(notConfiguredCount > 0,
-            "Expected at least one module with state 'not_configured'");
     }
 
     [Fact]
@@ -167,7 +181,8 @@ public sealed class ApiEndpointTests : IClassFixture<ApiEndpointFactory>
     {
         var client = _factory.CreateClient();
 
-        var response = await client.GetAsync("/api/v1/readiness");
+        var response = await client.GetAsync("/api/v1/harness/manifest");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var content = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(content);
 
@@ -175,13 +190,28 @@ public sealed class ApiEndpointTests : IClassFixture<ApiEndpointFactory>
         var moduleStates = modules.Select(m =>
         {
             m.TryGetProperty("module_id", out var id);
-            m.TryGetProperty("module_state", out var state);
+            m.TryGetProperty("registration_status", out var state);
             return (id.GetString() ?? "", state.GetString() ?? "");
         }).ToDictionary();
 
         // loop_guard and lifecycle should be "registered" (not "not_configured")
         Assert.Equal("registered", moduleStates["loop_guard"]);
         Assert.Equal("registered", moduleStates["lifecycle"]);
+    }
+
+    [Fact]
+    public async Task ToolLayerReadiness_UsesConfiguredDefaultWorkspaceRoot()
+    {
+        using var factory = new ToolLayerReadinessFactory();
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/v1/tool-layer-readiness");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var payload = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("ready", payload.GetProperty("status").GetString());
+        Assert.Equal(1, payload.GetProperty("tool_count").GetInt32());
+        Assert.Equal(factory.WorkspaceRoot, factory.Registry.LastWorkspaceRoot);
     }
 
     [Fact]
@@ -212,6 +242,70 @@ public sealed class ApiEndpointTests : IClassFixture<ApiEndpointFactory>
             Assert.True(template.TryGetProperty("provider_family", out _));
             Assert.True(template.TryGetProperty("capabilities", out _));
         }
+    }
+
+    private sealed class ToolLayerReadinessFactory : WebApplicationFactory<Program>
+    {
+        private readonly string _root = Path.Combine(Path.GetTempPath(), "tinadec-tool-readiness-tests", Guid.NewGuid().ToString("N"));
+
+        public ToolLayerReadinessFactory()
+        {
+            Directory.CreateDirectory(_root);
+            WorkspaceRoot = Path.Combine(_root, "workspace");
+            Directory.CreateDirectory(WorkspaceRoot);
+            Registry = new WorkspaceBoundToolRegistry(WorkspaceRoot);
+        }
+
+        public string WorkspaceRoot { get; }
+        public WorkspaceBoundToolRegistry Registry { get; }
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseSetting(WebHostDefaults.EnvironmentKey, "Testing");
+            builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["TinadecPersistence:Sqlite:DatabasePath"] = Path.Combine(_root, "tinadec.db"),
+                ["TinadecPersistence:DataRoot"] = Path.Combine(_root, "data"),
+                ["TinadecTools:DefaultWorkspaceRoot"] = WorkspaceRoot,
+                ["Logging:LogLevel:Default"] = "Warning"
+            }));
+            builder.ConfigureServices(services => services.AddSingleton<IToolRegistry>(Registry));
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
+        }
+    }
+
+    private sealed class WorkspaceBoundToolRegistry(string expectedWorkspaceRoot) : IToolRegistry
+    {
+        public string? LastWorkspaceRoot { get; private set; }
+
+        public Task<IReadOnlyList<ToolManifestEntryDto>> ListToolsAsync(string? workspaceRoot = null, CancellationToken cancellationToken = default)
+        {
+            LastWorkspaceRoot = workspaceRoot;
+            IReadOnlyList<ToolManifestEntryDto> tools = string.Equals(workspaceRoot, expectedWorkspaceRoot, StringComparison.Ordinal)
+                ?
+                [
+                    new ToolManifestEntryDto
+                    {
+                        Id = "test.echo",
+                        Description = "Test tool",
+                        InputSchema = JsonDocument.Parse("{\"type\":\"object\"}").RootElement.Clone()
+                    }
+                ]
+                : [];
+            return Task.FromResult(tools);
+        }
+
+        public async Task<IReadOnlyList<ToolManifestEntryDto>> SearchToolsAsync(string query, string? workspaceRoot = null, CancellationToken cancellationToken = default)
+            => await ListToolsAsync(workspaceRoot, cancellationToken);
+
+        public async Task<ToolManifestEntryDto?> FindToolAsync(string toolId, string? workspaceRoot = null, CancellationToken cancellationToken = default)
+            => (await ListToolsAsync(workspaceRoot, cancellationToken)).FirstOrDefault(tool => string.Equals(tool.Id, toolId, StringComparison.Ordinal));
     }
 }
 

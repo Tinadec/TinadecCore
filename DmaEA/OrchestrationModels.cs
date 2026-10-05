@@ -11,6 +11,8 @@ public sealed class AgentDefinition
     public string AgentType { get; init; } = string.Empty;
     public string? ModelRoutePurpose { get; init; }
     public string? SystemPrompt { get; init; }
+    /// <summary>Responsibility description a coordinator chooses this agent by.</summary>
+    public string? Description { get; init; }
     public IReadOnlyList<string> Capabilities { get; init; } = [];
     public IReadOnlyList<string> AllowedTools { get; init; } = [];
     public bool Enabled { get; init; }
@@ -21,8 +23,13 @@ public sealed class PlannedTask
 {
     [JsonPropertyName("task_key")]
     public string? TaskKey { get; init; }
+    /// <summary>Lane this task runs in; omitted or empty means the implicit "main" lane.</summary>
+    [JsonPropertyName("lane_key")]
+    public string? LaneKey { get; init; }
     [JsonPropertyName("title")]
     public string Title { get; init; } = string.Empty;
+    [JsonPropertyName("category")]
+    public string? Category { get; init; }
     [JsonPropertyName("description")]
     public string? Description { get; init; }
     [JsonPropertyName("success_criteria")]
@@ -33,10 +40,33 @@ public sealed class PlannedTask
     public string[] RequiredCapabilities { get; init; } = [];
     [JsonPropertyName("required_tools")]
     public string[] RequiredTools { get; init; } = [];
+    /// <summary>
+    /// The executor the coordinator hands this task to: a fixed id from the run's dispatch
+    /// roster, chosen by responsibility. Empty falls back to tool/capability matching.
+    /// </summary>
+    [JsonPropertyName("assignee")]
+    public string? Assignee { get; init; }
+    /// <summary>
+    /// Paths (inside the workspace) the task will write. Optional; when declared, the task leases them
+    /// exclusively when it starts, so a run that would write the same place is refused before either
+    /// runs a command, and what the task really changed is checked against it afterwards.
+    /// </summary>
+    [JsonPropertyName("write_scope")]
+    public string[] WriteScope { get; init; } = [];
     [JsonPropertyName("priority")]
     public int Priority { get; init; } = 1;
     [JsonPropertyName("risk")]
     public string Risk { get; init; } = "medium";
+
+    /// <summary>
+    /// True when this task is the planner's silent parse-failure fallback (whole
+    /// goal, no requirements) rather than a model-authored task. Never parsed
+    /// from model JSON: the engine refuses to dispatch a fallback goal-task
+    /// along declared edges (plan_parse_failed) instead of letting the
+    /// nearest-coverage tie-break mis-target it.
+    /// </summary>
+    [JsonIgnore]
+    public bool IsFallback { get; init; }
 }
 
 /// <summary>Outcome of executing one planned task.</summary>
@@ -47,6 +77,15 @@ public sealed class StepResult
     public string Status { get; init; } = "completed";
     public string Summary { get; init; } = string.Empty;
     public IReadOnlyList<string> Evidence { get; init; } = [];
+    public IReadOnlyList<LaneCriterionVerdict> CriterionVerdicts { get; init; } = [];
+
+    /// <summary>
+    /// Optional context patch proposed by the worker. The engine applies it
+    /// against the task's input context revision, so a result computed on stale
+    /// context loses the CAS race and stays audit-only.
+    /// </summary>
+    public string? ProposedPatchSummary { get; init; }
+    public string? ProposedPatchContent { get; init; }
 }
 
 /// <summary>Tenant/session/goal context shared across one orchestration run.</summary>

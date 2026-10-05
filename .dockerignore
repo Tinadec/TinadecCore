@@ -1,0 +1,11 @@
+.git
+.vs
+.idea
+**/bin
+**/obj
+**/data
+**/artifacts
+**/TestResults
+*.nupkg
+*.snupkg
+*.binlog

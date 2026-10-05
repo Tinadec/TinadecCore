@@ -1,0 +1,879 @@
+{
+  "api_version": "tinadec.io/agent-pack/v1alpha1",
+  "kind": "AgentPack",
+  "metadata": {
+    "pack_id": "tinadec.tests.bootstrap-pack",
+    "owner": "tinadec.tests",
+    "product_id": "tinadec.tests",
+    "name": "BootstrapFixturePack",
+    "version": "0.1.0"
+  },
+  "compatibility": {
+    "minimum_core_version": "0.1.0",
+    "required_core_capabilities": [
+      "agent_pack_lifecycle",
+      "versioned_agent_configuration",
+      "frozen_agent_version_binding"
+    ]
+  },
+  "resources": {
+    "agents": [
+      {
+        "resource_key": "meeting",
+        "slug": "meeting",
+        "display_name": "Meeting Agent",
+        "description": "Meeting Agent",
+        "layer": "operation",
+        "role": "session_coordinator",
+        "capabilities": [
+          "user.respond",
+          "task.dispatch",
+          "agent.create_temporary",
+          "agent.create_persistent",
+          "agent.create_profile"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [],
+        "system_prompt": "Act as the only user-facing coordinator. Understand intent, delegate work through the two-layer topology, and report concise conclusions backed by evidence.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "context_compressor",
+        "slug": "context_compressor",
+        "display_name": "Context Compressor",
+        "description": "Context Compressor",
+        "layer": "operation",
+        "role": "context_maintenance",
+        "capabilities": [
+          "context.read",
+          "context.patch"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [],
+        "system_prompt": "Compress long context while preserving goals, confirmed facts, approvals, tool outcomes, and unfinished work.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "skill_recommender",
+        "slug": "skill_recommender",
+        "display_name": "Skill Recommender",
+        "description": "Skill Recommender",
+        "layer": "operation",
+        "role": "capability_advisor",
+        "capabilities": [
+          "tool.search",
+          "agent.propose"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [],
+        "system_prompt": "Recommend the smallest sufficient set of skills and tools for the task, including reasons and material risks.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "supervisor",
+        "slug": "supervisor",
+        "display_name": "Supervisor",
+        "description": "Supervisor",
+        "layer": "operation",
+        "role": "quality_controller",
+        "capabilities": [
+          "supervision.review"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [],
+        "system_prompt": "Review plans and results for correctness, evidence, safety, and scope. Return pass, revise, or escalate without exceeding delegated authority.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "evolution",
+        "slug": "evolution",
+        "display_name": "Evolution Agent",
+        "description": "Evolution Agent",
+        "layer": "operation",
+        "role": "experience_curator",
+        "capabilities": [
+          "memory.candidate",
+          "agent.candidate",
+          "agent.create_persistent"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [],
+        "system_prompt": "Identify repeated patterns and capability gaps, then propose auditable Agent definitions for explicit user review.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "git_steward",
+        "slug": "git_steward",
+        "display_name": "Git Steward",
+        "description": "Git Steward",
+        "layer": "operation",
+        "role": "git_steward",
+        "capabilities": [
+          "git.review",
+          "git.commit_plan",
+          "approval.request"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [],
+        "system_prompt": "Review repository state and change boundaries, then produce an auditable commit plan without bypassing approval.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "task_planner",
+        "slug": "task_planner",
+        "display_name": "Task Planner",
+        "description": "Task Planner",
+        "layer": "execution",
+        "role": "execution_coordinator",
+        "capabilities": [
+          "task.plan",
+          "task.replan",
+          "agent.create_temporary"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [
+          "*"
+        ],
+        "system_prompt": "Turn the delegated goal into a dependency-aware task graph with explicit success criteria and assign each task to a suitable worker.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "worker.code",
+        "slug": "worker.code",
+        "display_name": "Code Worker",
+        "description": "Code Worker",
+        "layer": "execution",
+        "role": "task_executor",
+        "capabilities": [
+          "tool.code",
+          "tool.file"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [
+          "write_file",
+          "read_file",
+          "shell",
+          "mcp_invoke"
+        ],
+        "system_prompt": "Implement scoped code changes, verify behavior, and report exact evidence and remaining risk.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "worker.document",
+        "slug": "worker.document",
+        "display_name": "Document Worker",
+        "description": "Document Worker",
+        "layer": "execution",
+        "role": "task_executor",
+        "capabilities": [
+          "tool.document"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [
+          "write_file",
+          "read_file"
+        ],
+        "system_prompt": "Create and revise structured documents while preserving factual accuracy and the requested format.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "worker.data",
+        "slug": "worker.data",
+        "display_name": "Data Worker",
+        "description": "Data Worker",
+        "layer": "execution",
+        "role": "task_executor",
+        "capabilities": [
+          "tool.data"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [
+          "read_file",
+          "shell"
+        ],
+        "system_prompt": "Inspect and transform data reproducibly, validate assumptions, and summarize quality issues.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "worker.browser",
+        "slug": "worker.browser",
+        "display_name": "Browser Worker",
+        "description": "Browser Worker",
+        "layer": "execution",
+        "role": "task_executor",
+        "capabilities": [
+          "tool.search",
+          "tool.browser"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [
+          "browser.search",
+          "browser.fetch",
+          "mcp_search",
+          "mcp_invoke"
+        ],
+        "system_prompt": "Research current information, distinguish sources from inference, and return traceable evidence.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "worker.file",
+        "slug": "worker.file",
+        "display_name": "File Worker",
+        "description": "File Worker",
+        "layer": "execution",
+        "role": "task_executor",
+        "capabilities": [
+          "tool.file"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [
+          "write_file",
+          "read_file"
+        ],
+        "system_prompt": "Perform precise file operations within scope and verify the resulting filesystem state.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "worker.general",
+        "slug": "worker.general",
+        "display_name": "General Worker",
+        "description": "General Worker",
+        "layer": "execution",
+        "role": "task_executor",
+        "capabilities": [
+          "task.execute"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [
+          "*"
+        ],
+        "system_prompt": "Execute general delegated tasks within the stated constraints and return a concise, verifiable result.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      },
+      {
+        "resource_key": "worker.git",
+        "slug": "worker.git",
+        "display_name": "Git Worker",
+        "description": "Git Worker",
+        "layer": "execution",
+        "role": "git_specialist",
+        "capabilities": [
+          "tool.git"
+        ],
+        "model_strategy": {
+          "kind": "inherit"
+        },
+        "tool_scope": [
+          "git_status",
+          "git_diff",
+          "git_stage",
+          "git_unstage",
+          "git_commit",
+          "git_push",
+          "git_push_readiness",
+          "git_fetch",
+          "git_pull",
+          "git_branch_list",
+          "git_checkout",
+          "git_branch_create",
+          "git_branch_delete",
+          "git_branch_rename",
+          "git_worktree_list",
+          "git_worktree_create",
+          "git_worktree_remove",
+          "git_merge",
+          "git_rebase",
+          "git_conflict_preview",
+          "git_conflict_resolve"
+        ],
+        "system_prompt": "Execute approved Git operations exactly, preserve unrelated work, and report repository state after each mutation.",
+        "enabled": true,
+        "base_prompt_pipeline_ref": "prompt:baseline-prompt"
+      }
+    ],
+    "prompt_pipelines": [
+      {
+        "resource_key": "baseline-prompt",
+        "slug": "baseline-prompt",
+        "display_name": "Baseline Prompt",
+        "description": "Bootstrap fixture prompt.",
+        "graph": {
+          "nodes": [
+            {
+              "id": "template",
+              "type": "template"
+            },
+            {
+              "id": "assemble",
+              "type": "assemble"
+            }
+          ],
+          "edges": [
+            {
+              "source": "template",
+              "target": "assemble"
+            }
+          ]
+        }
+      }
+    ],
+    "modes": [
+      {
+        "resource_key": "conversation.ask",
+        "slug": "conversation.ask",
+        "display_name": "Ask",
+        "description": "Ask",
+        "nodes": [
+          {
+            "node_key": "n-01-meeting",
+            "agent_ref": "agent:meeting",
+            "layer": "operation",
+            "label": "Meeting Agent",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-02-task-planner",
+            "agent_ref": "agent:task_planner",
+            "layer": "execution",
+            "label": "Task Planner",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-03-worker-browser",
+            "agent_ref": "agent:worker.browser",
+            "layer": "execution",
+            "label": "Browser Worker",
+            "config": {},
+            "position": {}
+          }
+        ],
+        "edges": [],
+        "canvas_layout": {}
+      },
+      {
+        "resource_key": "conversation.vibe",
+        "slug": "conversation.vibe",
+        "display_name": "Vibe",
+        "description": "Vibe",
+        "nodes": [
+          {
+            "node_key": "n-01-meeting",
+            "agent_ref": "agent:meeting",
+            "layer": "operation",
+            "label": "Meeting Agent",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-02-task-planner",
+            "agent_ref": "agent:task_planner",
+            "layer": "execution",
+            "label": "Task Planner",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-03-worker-browser",
+            "agent_ref": "agent:worker.browser",
+            "layer": "execution",
+            "label": "Browser Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-04-worker-general",
+            "agent_ref": "agent:worker.general",
+            "layer": "execution",
+            "label": "General Worker",
+            "config": {},
+            "position": {}
+          }
+        ],
+        "edges": [],
+        "canvas_layout": {}
+      },
+      {
+        "resource_key": "conversation.plan",
+        "slug": "conversation.plan",
+        "display_name": "Plan",
+        "description": "Plan",
+        "nodes": [
+          {
+            "node_key": "n-01-meeting",
+            "agent_ref": "agent:meeting",
+            "layer": "operation",
+            "label": "Meeting Agent",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-02-context-compressor",
+            "agent_ref": "agent:context_compressor",
+            "layer": "operation",
+            "label": "Context Compressor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-03-supervisor",
+            "agent_ref": "agent:supervisor",
+            "layer": "operation",
+            "label": "Supervisor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-04-task-planner",
+            "agent_ref": "agent:task_planner",
+            "layer": "execution",
+            "label": "Task Planner",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-05-worker-browser",
+            "agent_ref": "agent:worker.browser",
+            "layer": "execution",
+            "label": "Browser Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-06-worker-document",
+            "agent_ref": "agent:worker.document",
+            "layer": "execution",
+            "label": "Document Worker",
+            "config": {},
+            "position": {}
+          }
+        ],
+        "edges": [],
+        "canvas_layout": {}
+      },
+      {
+        "resource_key": "conversation.spec",
+        "slug": "conversation.spec",
+        "display_name": "Spec",
+        "description": "Spec",
+        "nodes": [
+          {
+            "node_key": "n-01-meeting",
+            "agent_ref": "agent:meeting",
+            "layer": "operation",
+            "label": "Meeting Agent",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-02-context-compressor",
+            "agent_ref": "agent:context_compressor",
+            "layer": "operation",
+            "label": "Context Compressor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-03-supervisor",
+            "agent_ref": "agent:supervisor",
+            "layer": "operation",
+            "label": "Supervisor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-04-task-planner",
+            "agent_ref": "agent:task_planner",
+            "layer": "execution",
+            "label": "Task Planner",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-05-worker-browser",
+            "agent_ref": "agent:worker.browser",
+            "layer": "execution",
+            "label": "Browser Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-06-worker-document",
+            "agent_ref": "agent:worker.document",
+            "layer": "execution",
+            "label": "Document Worker",
+            "config": {},
+            "position": {}
+          }
+        ],
+        "edges": [],
+        "canvas_layout": {}
+      },
+      {
+        "resource_key": "conversation.auto",
+        "slug": "conversation.auto",
+        "display_name": "Auto",
+        "description": "Auto",
+        "nodes": [
+          {
+            "node_key": "n-01-meeting",
+            "agent_ref": "agent:meeting",
+            "layer": "operation",
+            "label": "Meeting Agent",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-02-context-compressor",
+            "agent_ref": "agent:context_compressor",
+            "layer": "operation",
+            "label": "Context Compressor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-03-skill-recommender",
+            "agent_ref": "agent:skill_recommender",
+            "layer": "operation",
+            "label": "Skill Recommender",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-04-supervisor",
+            "agent_ref": "agent:supervisor",
+            "layer": "operation",
+            "label": "Supervisor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-05-task-planner",
+            "agent_ref": "agent:task_planner",
+            "layer": "execution",
+            "label": "Task Planner",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-06-worker-browser",
+            "agent_ref": "agent:worker.browser",
+            "layer": "execution",
+            "label": "Browser Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-07-worker-document",
+            "agent_ref": "agent:worker.document",
+            "layer": "execution",
+            "label": "Document Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-08-worker-file",
+            "agent_ref": "agent:worker.file",
+            "layer": "execution",
+            "label": "File Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-09-worker-general",
+            "agent_ref": "agent:worker.general",
+            "layer": "execution",
+            "label": "General Worker",
+            "config": {},
+            "position": {}
+          }
+        ],
+        "edges": [],
+        "canvas_layout": {}
+      },
+      {
+        "resource_key": "conversation.agent",
+        "slug": "conversation.agent",
+        "display_name": "Agent",
+        "description": "Agent",
+        "nodes": [
+          {
+            "node_key": "n-01-meeting",
+            "agent_ref": "agent:meeting",
+            "layer": "operation",
+            "label": "Meeting Agent",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-02-context-compressor",
+            "agent_ref": "agent:context_compressor",
+            "layer": "operation",
+            "label": "Context Compressor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-03-skill-recommender",
+            "agent_ref": "agent:skill_recommender",
+            "layer": "operation",
+            "label": "Skill Recommender",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-04-supervisor",
+            "agent_ref": "agent:supervisor",
+            "layer": "operation",
+            "label": "Supervisor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-05-evolution",
+            "agent_ref": "agent:evolution",
+            "layer": "operation",
+            "label": "Evolution Agent",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-06-task-planner",
+            "agent_ref": "agent:task_planner",
+            "layer": "execution",
+            "label": "Task Planner",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-07-worker-code",
+            "agent_ref": "agent:worker.code",
+            "layer": "execution",
+            "label": "Code Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-08-worker-document",
+            "agent_ref": "agent:worker.document",
+            "layer": "execution",
+            "label": "Document Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-09-worker-data",
+            "agent_ref": "agent:worker.data",
+            "layer": "execution",
+            "label": "Data Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-10-worker-browser",
+            "agent_ref": "agent:worker.browser",
+            "layer": "execution",
+            "label": "Browser Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-11-worker-file",
+            "agent_ref": "agent:worker.file",
+            "layer": "execution",
+            "label": "File Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-12-worker-general",
+            "agent_ref": "agent:worker.general",
+            "layer": "execution",
+            "label": "General Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-13-worker-git",
+            "agent_ref": "agent:worker.git",
+            "layer": "execution",
+            "label": "Git Worker",
+            "config": {},
+            "position": {}
+          }
+        ],
+        "edges": [],
+        "canvas_layout": {}
+      },
+      {
+        "resource_key": "default-mode",
+        "slug": "default-mode",
+        "display_name": "Default Mode",
+        "description": "Default Mode",
+        "nodes": [
+          {
+            "node_key": "n-01-meeting",
+            "agent_ref": "agent:meeting",
+            "layer": "operation",
+            "label": "Meeting Agent",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-02-context-compressor",
+            "agent_ref": "agent:context_compressor",
+            "layer": "operation",
+            "label": "Context Compressor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-03-skill-recommender",
+            "agent_ref": "agent:skill_recommender",
+            "layer": "operation",
+            "label": "Skill Recommender",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-04-supervisor",
+            "agent_ref": "agent:supervisor",
+            "layer": "operation",
+            "label": "Supervisor",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-05-evolution",
+            "agent_ref": "agent:evolution",
+            "layer": "operation",
+            "label": "Evolution Agent",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-06-git-steward",
+            "agent_ref": "agent:git_steward",
+            "layer": "operation",
+            "label": "Git Steward",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-07-task-planner",
+            "agent_ref": "agent:task_planner",
+            "layer": "execution",
+            "label": "Task Planner",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-08-worker-code",
+            "agent_ref": "agent:worker.code",
+            "layer": "execution",
+            "label": "Code Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-09-worker-document",
+            "agent_ref": "agent:worker.document",
+            "layer": "execution",
+            "label": "Document Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-10-worker-data",
+            "agent_ref": "agent:worker.data",
+            "layer": "execution",
+            "label": "Data Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-11-worker-browser",
+            "agent_ref": "agent:worker.browser",
+            "layer": "execution",
+            "label": "Browser Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-12-worker-file",
+            "agent_ref": "agent:worker.file",
+            "layer": "execution",
+            "label": "File Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-13-worker-general",
+            "agent_ref": "agent:worker.general",
+            "layer": "execution",
+            "label": "General Worker",
+            "config": {},
+            "position": {}
+          },
+          {
+            "node_key": "n-14-worker-git",
+            "agent_ref": "agent:worker.git",
+            "layer": "execution",
+            "label": "Git Worker",
+            "config": {},
+            "position": {}
+          }
+        ],
+        "edges": [],
+        "canvas_layout": {}
+      }
+    ]
+  },
+  "activation": {
+    "workspace_defaults": {
+      "agent_ref": "agent:meeting",
+      "mode_ref": "mode:default-mode",
+      "prompt_pipeline_ref": "prompt:baseline-prompt"
+    }
+  }
+}

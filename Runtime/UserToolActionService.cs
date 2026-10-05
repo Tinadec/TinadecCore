@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using TinadecCore.Abstractions;
 using TinadecCore.Abstractions.Ports;
 using TinadecCore.Contracts.Dtos;
 using TinadecCore.Lifecycle;
@@ -117,7 +118,7 @@ public sealed class UserToolActionService : IUserToolActionService, IUserToolAct
             }
             catch (Exception ex) when (ex is IOException or InvalidOperationException or UnauthorizedAccessException or DirectoryNotFoundException)
             {
-                await BlockAsync(action, "snapshot_failed", SafeMessage(ex.Message), cancellationToken).ConfigureAwait(false);
+                await BlockAsync(action, RunErrorTaxonomy.SnapshotFailed, SafeMessage(ex.Message), cancellationToken).ConfigureAwait(false);
                 return await ToResultAsync(action, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -282,14 +283,14 @@ public sealed class UserToolActionService : IUserToolActionService, IUserToolAct
             ?? throw new KeyNotFoundException("User tool action was not found.");
         var scope = _tenant.Current;
         if (action.PrincipalId != scope.PrincipalId) throw new UnauthorizedAccessException("Only the initiating user may override a snapshot failure.");
-        if (!action.MutatesWorkspace || action.ErrorCategory != "snapshot_failed" || IsTerminal(action.Status) && action.Status != UserToolActionStatuses.Blocked)
+        if (!action.MutatesWorkspace || action.ErrorCategory != RunErrorTaxonomy.SnapshotFailed || IsTerminal(action.Status) && action.Status != UserToolActionStatuses.Blocked)
             throw new InvalidOperationException("Only a blocked snapshot failure can be overridden.");
         if (string.IsNullOrWhiteSpace(reason)) throw new ArgumentException("A snapshot override reason is required.", nameof(reason));
         action.SnapshotOverride = true;
         action.SnapshotOverrideReason = SafeMessage(reason);
         action.NonReversible = true;
         action.CompensationGuidance = "Inspect the resulting workspace state and apply a manual compensating change; Core has no snapshot to restore for this action.";
-        action.ErrorCategory = "snapshot_override";
+        action.ErrorCategory = RunErrorTaxonomy.SnapshotOverride;
         action.SafeErrorMessage = "User explicitly accepted a non-reversible write without a workspace snapshot.";
         action.Status = "requested";
         action.CompletedAt = null;
@@ -342,7 +343,7 @@ public sealed class UserToolActionService : IUserToolActionService, IUserToolAct
                 .SetProperty(x => x.RecoveryDecision, normalized)
                 .SetProperty(x => x.RecoveryReason, SafeMessage(reason))
                 .SetProperty(x => x.RecoveredAt, now)
-                .SetProperty(x => x.ErrorCategory, normalized == "mark_completed" ? null : "recovery_marked_failed")
+                .SetProperty(x => x.ErrorCategory, normalized == "mark_completed" ? null : RunErrorTaxonomy.RecoveryMarkedFailed)
                 .SetProperty(x => x.SafeErrorMessage, normalized == "mark_completed" ? null : SafeMessage(reason))
                 .SetProperty(x => x.CompletedAt, now)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
@@ -518,12 +519,28 @@ public sealed class UserToolActionService : IUserToolActionService, IUserToolAct
         if (existing is not null) return existing.Id;
         var now = DateTimeOffset.UtcNow;
         var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+        // A reviewer cannot decide "User requested 'write_file'" without knowing which
+        // file. The parameters are read back exactly once here, at mint, so the
+        // approvals list stays a pure projection; a content failure leaves the row
+        // without evidence rather than blocking an approval that must exist.
+        var argumentsDigest = string.Empty;
+        try
+        {
+            var mintParameters = await ReadContentAsync(action.ParametersReference, action.ParametersHash,
+                action.ParametersLength, "application/json", cancellationToken).ConfigureAwait(false);
+            argumentsDigest = ApprovalEvidenceProjector.Encode(
+                ApprovalEvidenceProjector.Project(action.ToolId, mintParameters));
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or KeyNotFoundException or UnauthorizedAccessException)
+        {
+        }
         var row = new ApprovalRequestRecord
         {
             Id = Guid.NewGuid(), TenantId = scope.TenantId, WorkspaceId = scope.WorkspaceId, ProjectId = action.ProjectId,
             UserToolActionId = action.Id, Kind = "user_tool", ToolId = action.ToolId, Risk = action.Risk,
             RequestHash = action.ParametersHash, NonceHash = ToolParametersHash.Compute(nonce),
             NonceSecretReference = $"approval_nonce_{scope.TenantId:N}_{Guid.NewGuid():N}", ParametersReference = action.ParametersReference,
+            ArgumentsDigest = argumentsDigest,
             Summary = $"User requested '{action.ToolId}'.", Status = "pending", ExpiresAt = now.AddMinutes(30),
             RequestedByPrincipalId = scope.PrincipalId, CreatedAt = now, UpdatedAt = now, Nonce = nonce
         };

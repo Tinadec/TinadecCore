@@ -13,6 +13,16 @@ namespace TinadecCore.AspNetCore.Endpoints;
 
 public static class InteractionsEndpoints
 {
+    private const string TinaChatInputLockedCode = "tina_chat_input_locked";
+    private const string TinaChatInputLockedDetail = "Use the TinaChat intent execution endpoint for this isolated handoff. New instructions belong in a new intent revision.";
+
+    /// <summary>
+    /// Bounded because each id costs the user a stored upload that a message may never
+    /// claim, and because the model-facing manifest lists a fixed number of rows. Eight
+    /// matches what comparable local-first harnesses cap a message at.
+    /// </summary>
+    private const int MaxAttachmentsPerMessage = 8;
+
     public static IEndpointRouteBuilder MapInteractionsEndpoints(this IEndpointRouteBuilder app)
     {
         app.MapPost("/api/v1/sessions/{sessionId:guid}/interactions", CreateInteraction);
@@ -22,21 +32,39 @@ public static class InteractionsEndpoints
         return app;
     }
 
-    static async Task<IResult> CreateInteraction(Guid sessionId, HttpRequest req, IDbContextFactory<AgentConfigurationDbContext> cfgFactory, ITenantContextAccessor tenant, IAgentModelResolver modelResolver, ProjectSessionStore sessions, IConversationStore conversations, IFullDuplexRunCoordinator coordinator, StorageLifecycleService lifecycle, CancellationToken ct)
+    static async Task<IResult> CreateInteraction(Guid sessionId, HttpRequest req, IDbContextFactory<AgentConfigurationDbContext> cfgFactory, IDbContextFactory<LifecycleDbContext> lifecycleDbFactory, ITenantContextAccessor tenant, IAgentModelResolver modelResolver, ProjectSessionStore sessions, IConversationStore conversations, IFullDuplexRunCoordinator coordinator, IMessageAttachmentStore attachments, StorageLifecycleService lifecycle, ILifecycleManager lifecycleManager, CancellationToken ct)
     {
         var el = await JsonSerializer.DeserializeAsync<JsonElement>(req.Body, cancellationToken: ct);
-        var content = el.TryGetProperty("content", out var c) ? c.GetString() : null;
-        if (string.IsNullOrWhiteSpace(content)) return Results.BadRequest(new { code = "invalid_request", message = "content is required" });
+        if (el.ValueKind != JsonValueKind.Object) return Results.BadRequest(new { code = "invalid_request", message = "Body must be a JSON object." });
+        // Fail closed on retired/unknown keys so a stale client cannot silently
+        // admit a run under a mode nobody reads anymore.
+        var unknownField = el.EnumerateObject()
+            .Select(property => property.Name)
+            .FirstOrDefault(name => name is not ("content" or "client_message_id" or "mode_version_id" or "permission_mode" or "dispatch_mode" or "target_run_id" or "expected_context_revision" or "meeting_model_override" or "attachment_ids" or "interrupt"));
+        if (unknownField is not null) return Results.BadRequest(new { code = "unknown_field", message = $"Field '{unknownField}' is not part of the interaction contract." });
+        var content = el.TryGetProperty("content", out var c) ? c.GetString() ?? string.Empty : string.Empty;
+        // Not "content is required" here: a message that carries a file does say something, it
+        // just does not say it in words. The refusal belongs below, where the attachment ids have
+        // been parsed, so the two together decide whether this turn says anything at all.
+        var hasText = !string.IsNullOrWhiteSpace(content);
         var clientMessageId = el.TryGetProperty("client_message_id", out var cm) ? cm.GetString() : Guid.NewGuid().ToString("N");
         var modeVersionId = el.TryGetProperty("mode_version_id", out var mv) && Guid.TryParse(mv.GetString(), out var g) ? g : (Guid?)null;
-        var agentMode = el.TryGetProperty("agent_mode", out var am) ? am.GetString()?.Trim().ToLowerInvariant() : null;
-        if (agentMode is not (null or "plan" or "spec" or "ask" or "vibe" or "auto" or "agent"))
-            return Results.BadRequest(new { code = "invalid_request", message = "agent_mode must be one of plan|spec|ask|vibe|auto|agent" });
         var dispatchMode = el.TryGetProperty("dispatch_mode", out var dm) ? dm.GetString()?.Trim().ToLowerInvariant() : "queued";
         if (dispatchMode is not ("queued" or "insert" or "parallel")) return Results.BadRequest(new { code = "invalid_request", message = "dispatch_mode must be queued|insert|parallel" });
         Guid? targetRunId = null;
         if (el.TryGetProperty("target_run_id", out var tr) && Guid.TryParse(tr.GetString(), out var tg)) targetRunId = tg;
         if (dispatchMode == "insert" && targetRunId is null) return Results.BadRequest(new { code = "invalid_request", message = "insert requires target_run_id" });
+        // Hard insert (todo D2): the steering also cuts off what the run is doing now instead of
+        // waiting for its next boundary. Only an insert steers a run, so only an insert can.
+        var interrupt = false;
+        if (el.TryGetProperty("interrupt", out var interruptElement) && interruptElement.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined))
+        {
+            if (interruptElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                return Results.BadRequest(new { code = "invalid_request", message = "interrupt must be a boolean." });
+            interrupt = interruptElement.GetBoolean();
+            if (interrupt && dispatchMode != "insert")
+                return Results.BadRequest(new { code = "invalid_request", message = "interrupt applies to dispatch_mode insert only." });
+        }
         MeetingModelOverrideDto? meetingModelOverride = null;
         if (el.TryGetProperty("meeting_model_override", out var overrideElement)
             && overrideElement.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined))
@@ -60,6 +88,125 @@ public static class InteractionsEndpoints
         var session = await sessions.FindAsync(sessionId, ct);
         if (session is null) return Results.NotFound(new { code = "not_found", message = "Session not found" });
 
+        // An attachment is claimed by the message this interaction appends, so the ids
+        // arrive with the send rather than in a second request that could race it.
+        IReadOnlyList<Guid>? attachmentIds = null;
+        if (el.TryGetProperty("attachment_ids", out var attachmentElement)
+            && attachmentElement.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined))
+        {
+            if (attachmentElement.ValueKind != JsonValueKind.Array)
+            {
+                return Results.BadRequest(new { code = "attachment_ids_invalid", message = "attachment_ids must be an array of attachment ids." });
+            }
+            // Steering writes a context patch and appends no user message. Accepting ids
+            // there would strand the upload with nothing to name it, so the request is
+            // refused where the client can read why.
+            if (dispatchMode == "insert")
+            {
+                return Results.BadRequest(new { code = "attachment_dispatch_unsupported", message = "Steering inserts no user message, so it cannot carry attachments. Send the file as its own message." });
+            }
+            var ids = new List<Guid>(attachmentElement.GetArrayLength());
+            foreach (var item in attachmentElement.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.String || !Guid.TryParse(item.GetString(), out var parsedId))
+                {
+                    return Results.BadRequest(new { code = "attachment_ids_invalid", message = "Every attachment id must be a guid string." });
+                }
+                ids.Add(parsedId);
+            }
+            if (ids.Count > MaxAttachmentsPerMessage)
+            {
+                return Results.BadRequest(new { code = "attachment_count_exceeded", message = $"A message carries at most {MaxAttachmentsPerMessage} attachments.", max = MaxAttachmentsPerMessage });
+            }
+            if (ids.Count > 0)
+            {
+                // Pre-flight against the session's unbound rows before a run exists. The
+                // bind below still re-checks; this is what stops the common mistake — a
+                // stale id from a session the user has since left — from starting a run
+                // whose message silently carries nothing.
+                var unbound = await attachments.ListAsync(sessionId, ct).ConfigureAwait(false);
+                // "Unbound" is the wrong ceiling for a retry. When the first response was lost,
+                // the rows are bound - to the message this same client_message_id already names -
+                // and refusing the resend told the user their own file does not exist. The bind
+                // below treats rows the message already owns as success, so the replay was always
+                // meant to get this far; only this pre-flight blocked it.
+                var replayTarget = string.IsNullOrWhiteSpace(clientMessageId)
+                    ? null
+                    : await conversations.FindMessageByClientMessageIdAsync(sessionId, clientMessageId, ct).ConfigureAwait(false);
+                var presentable = unbound
+                    .Where(row => row.MessageId is null || (replayTarget is not null && row.MessageId == replayTarget.Id))
+                    .Select(row => row.Id);
+                var missing = ids.Except(presentable).ToArray();
+                if (missing.Length > 0)
+                {
+                    return Results.BadRequest(new { code = "attachment_not_found", message = $"No unbound attachment in this session has the id(s): {string.Join(", ", missing)}.", missing });
+                }
+            }
+            attachmentIds = ids;
+        }
+
+        if (!hasText && attachmentIds is not { Count: > 0 })
+        {
+            // Same machine code the empty-content contract has always answered with; only the
+            // message grew, because "content is required" was a lie by omission - attaching the
+            // file is the other way to say something.
+            return Results.BadRequest(new { code = "invalid_request", message = "content is required unless the message carries an attachment." });
+        }
+
+        // The message is appended first (its id comes from the run admission or the queued
+        // branch), so binding is a second step and a crash between the two is possible. It
+        // is recoverable by design: the same client_message_id replays onto the same
+        // message, and BindToMessageAsync treats rows it already owns as success.
+        async Task<IResult?> BindAttachmentsAsync(Guid messageId)
+        {
+            if (attachmentIds is null) return null;
+            try
+            {
+                await attachments.BindToMessageAsync(sessionId, messageId, attachmentIds, ct).ConfigureAwait(false);
+                return null;
+            }
+            catch (AttachmentBindingException ex)
+            {
+                return Results.BadRequest(new { code = ex.Code, message = ex.Message });
+            }
+        }
+
+        // An insertion bypasses coordinator admission, so enforce the communication
+        // binding here too, before persisting any context patch or mutable mode.
+        var chatInputs = req.HttpContext.RequestServices.GetService<ITinaChatRunInput>();
+        var chatInput = chatInputs is null ? null : await chatInputs.GetForSessionAsync(sessionId, ct);
+        if (chatInput is not null)
+            return TinaChatInputLocked(req);
+
+        // A file with no words is not a request, so this turn appends to the transcript and
+        // starts nothing. Run admission keeps its own "message content is required" rule
+        // untouched - what changed is the refusal to pretend that uploading a file is a
+        // question. The next typed turn sees the file: the context builder lists attachments
+        // bound to user messages inside its window, so the bytes reach the model through the
+        // evidence section plus, when needed, `read_attachment` by the id printed there.
+        if (!hasText)
+        {
+            var fileOnlyMessage = await conversations.AppendMessageAsync(
+                sessionId, "user", string.Empty, clientMessageId: clientMessageId, cancellationToken: ct).ConfigureAwait(false);
+            var fileOnlyBind = await BindAttachmentsAsync(fileOnlyMessage.Id).ConfigureAwait(false);
+            if (fileOnlyBind is not null) return fileOnlyBind;
+            return Results.Created($"/api/v1/sessions/{sessionId}/interactions/{fileOnlyMessage.Id}", new
+            {
+                interaction_id = fileOnlyMessage.Id,
+                session_id = sessionId,
+                message_id = fileOnlyMessage.Id,
+                // No run_id key at all: this host drops nulls on write, so "there is no run"
+                // travels as an absent field - which is what the client already tests with
+                // `if (resp.run_id)`. Writing `run_id = null` here would be a comment posing
+                // as data.
+                status = "message_only",
+                attachment_ids = attachmentIds,
+                client_message_id = clientMessageId,
+                context_revision = await conversations.GetContextRevisionAsync(sessionId, ct).ConfigureAwait(false),
+                correlation_id = clientMessageId
+            });
+        }
+
         // mode_version validation if provided
         if (modeVersionId.HasValue)
         {
@@ -70,61 +217,78 @@ public static class InteractionsEndpoints
             if (mvRec is null) return Results.BadRequest(new { code = "invalid_request", message = "mode_version_id must reference a published mode in this workspace" });
         }
 
-        // Composer agent_mode selects a published conversation mode for this workspace.
-        // Resolution order: explicit mode_version_id > agent_mode slug (conversation.*) >
-        // the session's existing mode (workspace default applied at session creation).
-        // The resolved version is persisted onto the session so the run engine's roster
-        // resolver freezes the exact relational mode the Agent Center edits.
-        if (modeVersionId is null && agentMode is not null)
+        // Mode identity is the published ModeVersion only. Resolution order:
+        // explicit mode_version_id > the session's bound mode version > the
+        // workspace default. The resolved version is persisted onto the session
+        // so the run engine's roster resolver freezes the exact relational mode
+        // the Agent Center edits.
+        modeVersionId ??= session.ModeVersionId;
+        if (modeVersionId is null)
         {
             await using var cfg = await cfgFactory.CreateDbContextAsync(ct);
-            var slug = $"conversation.{agentMode}";
-            var candidateModes = await cfg.AgentModes.AsNoTracking().Where(
-                x => x.TenantId == session.TenantId && x.WorkspaceId == session.WorkspaceId && x.Slug == slug && x.Status == "published").ToListAsync(ct);
-            Guid? sourceInstallationId = null;
-            if (session.ModeVersionId is { } currentModeVersionId)
-            {
-                var currentModeId = await cfg.ModeVersions.AsNoTracking()
-                    .Where(version => version.Id == currentModeVersionId && version.TenantId == session.TenantId && version.WorkspaceId == session.WorkspaceId)
-                    .Select(version => (Guid?)version.AgentModeId)
-                    .SingleOrDefaultAsync(ct);
-                if (currentModeId is { } logicalModeId)
-                    sourceInstallationId = await cfg.AgentPackManagedResources.AsNoTracking()
-                        .Where(resource => resource.ResourceKind == "mode" && resource.LogicalEntityId == logicalModeId)
-                        .Select(resource => (Guid?)resource.InstallationId)
-                        .SingleOrDefaultAsync(ct);
-            }
-            AgentModeRecord? mode = null;
-            if (sourceInstallationId is { } installationId)
-            {
-                var managedModeId = await cfg.AgentPackManagedResources.AsNoTracking()
-                    .Where(resource => resource.InstallationId == installationId
-                        && resource.ResourceKind == "mode"
-                        && candidateModes.Select(candidate => candidate.Id).Contains(resource.LogicalEntityId))
-                    .Select(resource => (Guid?)resource.LogicalEntityId)
-                    .SingleOrDefaultAsync(ct);
-                mode = candidateModes.SingleOrDefault(candidate => candidate.Id == managedModeId);
-            }
-            mode ??= candidateModes
-                .Where(candidate => !cfg.AgentPackManagedResources.AsNoTracking().Any(resource => resource.ResourceKind == "mode" && resource.LogicalEntityId == candidate.Id))
-                .OrderByDescending(candidate => candidate.UpdatedAt)
-                .FirstOrDefault();
-            if (mode is null) return Results.BadRequest(new { code = "invalid_request", message = $"agent_mode '{agentMode}' has no published mode for this workspace" });
-            var version = await cfg.ModeVersions.AsNoTracking()
-                .Where(x => x.AgentModeId == mode.Id && x.TenantId == session.TenantId && x.WorkspaceId == session.WorkspaceId && x.Status == "published")
-                .OrderByDescending(x => x.Version)
-                .Select(x => (Guid?)x.Id)
+            modeVersionId = await cfg.WorkspaceDefaults.AsNoTracking()
+                .Where(x => x.TenantId == session.TenantId && x.WorkspaceId == session.WorkspaceId
+                    && x.Status == "active" && x.ArchivedAt == null)
+                .Select(x => x.DefaultModeVersionId)
                 .FirstOrDefaultAsync(ct);
-            if (version is null) return Results.BadRequest(new { code = "invalid_request", message = $"agent_mode '{agentMode}' has no published version" });
-            modeVersionId = version;
         }
-
-        modeVersionId ??= session.ModeVersionId;
         if (modeVersionId is null)
             return Results.Conflict(new { code = "agent_mode_not_configured", message = "A published Agent Mode must be configured before creating an interaction." });
 
+        // A disabled pack fails explicitly: the run must not silently fall back to
+        // a different roster than the one the user is looking at. The client is
+        // told which pack to re-enable (or to pick another mode).
+        await using (var guard = await cfgFactory.CreateDbContextAsync(ct))
+        {
+            var ownerPack = await (from mode in guard.AgentModes.AsNoTracking()
+                                   join version in guard.ModeVersions.AsNoTracking() on mode.Id equals version.AgentModeId
+                                   join resource in guard.AgentPackManagedResources.AsNoTracking() on mode.Id equals resource.LogicalEntityId
+                                   join installation in guard.AgentPackInstallations.AsNoTracking() on resource.InstallationId equals installation.Id
+                                   where version.Id == modeVersionId.Value && version.Status == "published"
+                                   select new { installation.PackId, installation.Status }).FirstOrDefaultAsync(ct);
+            if (ownerPack is not null && !string.Equals(ownerPack.Status, "active", StringComparison.Ordinal))
+                return Results.Conflict(new
+                {
+                    code = "pack_disabled",
+                    message = $"Agent pack '{ownerPack.PackId}' is disabled. Enable it or choose a mode from an enabled pack.",
+                    pack_id = ownerPack.PackId
+                });
+        }
+
         if (dispatchMode == "insert" && meetingModelOverride is not null)
             return Results.Conflict(new { code = "model_override_frozen", message = "A model override cannot be changed when inserting into an already frozen run." });
+
+        // A session that has said nothing yet takes the conversation identity of the mode its
+        // first message is sent in. Revision 0 is the cheap pre-check (every append bumps it);
+        // the store re-checks for messages before it writes.
+        TinadecCore.Runtime.ConversationIdentityResolver.ConversationIdentity? resolvedIdentity = null;
+        if (modeVersionId.HasValue)
+        {
+            await using var cfg = await cfgFactory.CreateDbContextAsync(ct);
+            var snapshotJson = await cfg.ModeVersions.AsNoTracking()
+                .Where(x => x.Id == modeVersionId.Value && x.TenantId == session.TenantId && x.WorkspaceId == session.WorkspaceId)
+                .Select(x => x.SnapshotJson)
+                .FirstOrDefaultAsync(ct);
+            var definitions = await cfg.AgentDefinitions.AsNoTracking()
+                .Where(x => x.TenantId == session.TenantId && x.WorkspaceId == session.WorkspaceId)
+                .Select(x => new TinadecCore.Runtime.ConversationIdentityResolver.DefinitionInput(x.Id, x.Slug, x.Layer, x.CapabilitiesJson))
+                .ToListAsync(ct);
+            resolvedIdentity = TinadecCore.Runtime.ConversationIdentityResolver.Resolve(snapshotJson, definitions);
+        }
+        var identityDiffers = resolvedIdentity is not null
+            && !string.Equals(resolvedIdentity.TemplateSlug, session.ConversationTemplateSlug, StringComparison.OrdinalIgnoreCase);
+        if (identityDiffers && await sessions.GetContextRevisionAsync(sessionId, ct).ConfigureAwait(false) == 0)
+        {
+            await sessions.AdoptConversationIdentityIfEmptyAsync(sessionId, resolvedIdentity!.NodeKey, resolvedIdentity.TemplateSlug, ct).ConfigureAwait(false);
+        }
+        // Todo E6 (one conversation identity): a session frozen on a legacy identity (an agent no
+        // mode still points at) may move to the requested mode's identity while nothing is running —
+        // an active run freezes its roster against the identity it started with, so under those the
+        // freeze gate's 409 stands on purpose.
+        else if (identityDiffers && (await lifecycleManager.ListActiveRunsAsync(sessionId, ct).ConfigureAwait(false)).Count == 0)
+        {
+            await sessions.MigrateConversationIdentityAsync(sessionId, resolvedIdentity!.NodeKey, resolvedIdentity.TemplateSlug, ct).ConfigureAwait(false);
+        }
 
         // Persist the chosen mode_version onto the session so the run engine's roster resolver
         // reads the same relational mode the center edits — not a per-call event hint.
@@ -153,41 +317,226 @@ public static class InteractionsEndpoints
                 await lifecycle.AppendRunStreamAsync(targetRunId.Value, new DurableRunStreamAppend(Guid.NewGuid(), "context_conflict", null, IdempotencyKey: $"run:{targetRunId}:conflict:{Guid.NewGuid():N}", FinishReason: "stale"), ct);
                 return Results.Conflict(new { code = "context_conflict", message = $"Context revision conflict: base {baseRev} vs current {patch.CurrentRevision}", base_revision = baseRev, current_revision = patch.CurrentRevision });
             }
-            await lifecycle.AppendEventAsync(targetRunId.Value, "interaction.steering", new { interaction_id = Guid.NewGuid(), target_run_id = targetRunId.Value, content, dispatch_mode = dispatchMode }, $"Steering injected into run {targetRunId}", "info", cancellationToken: ct);
+            await lifecycle.AppendEventAsync(targetRunId.Value, "interaction.steering", new { interaction_id = Guid.NewGuid(), target_run_id = targetRunId.Value, content, dispatch_mode = dispatchMode, interrupt }, $"Steering injected into run {targetRunId}", "info", cancellationToken: ct);
             await lifecycle.AppendRunStreamAsync(targetRunId.Value, new DurableRunStreamAppend(Guid.NewGuid(), "steering", null, IdempotencyKey: $"run:{targetRunId}:steering:{Guid.NewGuid():N}"), ct);
+            // The steering is durable above, so whatever the run redoes after the cut reads it. The
+            // signal reaches the run's calls on this host; elsewhere the next model call reads it anyway.
+            var interruptedModelCalls = 0;
+            if (interrupt && req.HttpContext.RequestServices.GetService<IRunInterrupts>() is { } interrupts)
+            {
+                interruptedModelCalls = interrupts.Request(targetRunId.Value, new RunInterruptRequest(patch.PatchId, content, DateTimeOffset.UtcNow));
+                await lifecycle.AppendEventAsync(targetRunId.Value, "interaction.interrupt_requested",
+                    new { target_run_id = targetRunId.Value, patch_id = patch.PatchId, interrupted_model_calls = interruptedModelCalls },
+                    "The user interrupted the run to steer it.", "info", cancellationToken: ct).ConfigureAwait(false);
+            }
+            // A supervision escalation is a durable user-review gate: the engine
+            // re-parks on every tick while the checkpoint phase is awaiting_user, so
+            // merely enqueueing a steering patch leaves it parked and the correction is
+            // never read. Supplying correction text IS the user decision to replan, so
+            // move the run back to executing first (the engine then applies the patch
+            // and returns the checkpoint to planning).
+            var parkedRun = await lifecycle.FindRunAsync(targetRunId.Value, ct).ConfigureAwait(false);
+            if (parkedRun is not null && parkedRun.Status == "awaiting_user")
+            {
+                await lifecycle.SetRunStatusAsync(
+                    targetRunId.Value,
+                    "executing",
+                    "User correction accepted; resuming after supervision review.",
+                    ct).ConfigureAwait(false);
+            }
             var engine = (IFullDuplexRunEngine)req.HttpContext.RequestServices.GetRequiredService(typeof(IFullDuplexRunEngine));
             await engine.EnqueueAsync(targetRunId.Value, ct);
-            return Results.Created($"/api/v1/sessions/{sessionId}/interactions/{targetRunId.Value}", new { interaction_id = Guid.NewGuid(), session_id = sessionId, run_id = targetRunId.Value, dispatch_mode = dispatchMode, status = "steering_injected", content });
+            var steeringCursor = await RunStreamCursorAsync(lifecycleDbFactory, targetRunId, ct).ConfigureAwait(false);
+            return Results.Created($"/api/v1/sessions/{sessionId}/interactions/{targetRunId.Value}", new { interaction_id = Guid.NewGuid(), session_id = sessionId, run_id = targetRunId.Value, dispatch_mode = dispatchMode, status = "steering_injected", content, client_message_id = clientMessageId, context_revision = patch.CurrentRevision, stream_cursor = steeringCursor, correlation_id = clientMessageId, interrupt, interrupted_model_calls = interruptedModelCalls });
         }
 
         // queued / parallel: normal admission via coordinator
         RunSubmission? admission = null;
         string admissionStatus = "queued";
-        try
-        {
-            // Composer agent modes belong to the conversation application: selecting one routes
-        // the runtime through the matching TOML conversation.* profile (policy + binding),
-        // while the roster freezes from the resolved relational mode version. No selection
-        // keeps the legacy space/full_duplex admission behavior.
-        var applicationMode = agentMode is null ? "space" : "conversation";
+        var permissionMode = el.TryGetProperty("permission_mode", out var pm) && !string.IsNullOrWhiteSpace(pm.GetString())
+            ? pm.GetString()!.Trim().ToLowerInvariant()
+            : "default";
         var invocationOverride = meetingModelOverride is null
             ? null
             : new SessionModelOverride(meetingModelOverride.ProviderInstanceId, meetingModelOverride.Model);
-        admission = await coordinator.SubmitAsync(new FullDuplexInvocation(sessionId, content, clientMessageId!, applicationMode, agentMode ?? "agent", "default", targetRunId, expectedRev, invocationOverride), ct);
+        try
+        {
+            // Mode identity is frozen from the session's bound/persisted mode
+            // version; no legacy application-mode/agent-mode admission surface
+            // exists anymore. Unattended permission policies ride on
+            // permission_mode alone.
+            // queued = after what the session is doing now (todo D1); parallel = alongside it,
+            // bounded by the active-run limit. The coordinator decides with the run ledger in hand.
+            admission = await coordinator.SubmitAsync(new FullDuplexInvocation(
+                sessionId,
+                content,
+                clientMessageId!,
+                permissionMode,
+                targetRunId,
+                expectedRev,
+                invocationOverride,
+                modeVersionId,
+                QueueBehindActiveRun: dispatchMode == "queued"), ct);
             admissionStatus = dispatchMode == "parallel" ? "assigned" : "queued";
         }
-        catch (RunAdmissionException ex) when (ex.Code == "ACTIVE_RUN_LIMIT" && dispatchMode == "queued")
+        catch (RunAdmissionException ex) when (ex.Code is "ACTIVE_RUN_LIMIT" or "SESSION_BUSY" && dispatchMode == "queued")
         {
-            // meeting busy -> keep queued without run
-            var queuedId = Guid.NewGuid();
-            // ponytail: no run yet, keep as transient queued interaction without durable event
-            return Results.Created($"/api/v1/sessions/{sessionId}/interactions/{queuedId}", new { interaction_id = queuedId, session_id = sessionId, run_id = (Guid?)null, dispatch_mode = dispatchMode, status = "queued", mode_version_id = modeVersionId, meeting_model_override = meetingModelOverride, reason = ex.Message });
+            // Meeting busy: the interaction must survive the wait. Persist a
+            // directive row + the user message + a run.queued event on the
+            // active run so the M2 run-terminal hook can drain it; the old
+            // branch fabricated a transient id and lost all three.
+            var idempotencyKey = $"session:{sessionId}:queued:{clientMessageId}";
+            await using var lifecycleDb = await lifecycleDbFactory.CreateDbContextAsync(ct);
+            var replay = await lifecycleDb.RunDirectives
+                .FirstOrDefaultAsync(x => x.IdempotencyKey == idempotencyKey, ct);
+            if (replay is { RunId: not null })
+            {
+                var replayRevision = await conversations.GetContextRevisionAsync(sessionId, ct).ConfigureAwait(false);
+                var replayCursor = await RunStreamCursorAsync(lifecycleDbFactory, replay.RunId, ct).ConfigureAwait(false);
+                if (replay.MessageId is { } replayMessageId)
+                {
+                    var replayBind = await BindAttachmentsAsync(replayMessageId).ConfigureAwait(false);
+                    if (replayBind is not null) return replayBind;
+                }
+                return Results.Created($"/api/v1/sessions/{sessionId}/interactions/{replay.Id}", new { interaction_id = replay.Id, session_id = sessionId, run_id = replay.RunId, dispatch_mode = dispatchMode, status = "queued", mode_version_id = modeVersionId, meeting_model_override = meetingModelOverride, reason = "replayed queued interaction", client_message_id = clientMessageId, context_revision = replayRevision, stream_cursor = replayCursor, correlation_id = clientMessageId });
+            }
+
+            var runs = await lifecycle.ListRunsAsync(sessionId, ct);
+            var activeRun = await QueueOwnerAsync(lifecycleDb, runs, ct).ConfigureAwait(false);
+            if (activeRun is null)
+            {
+                // The limiting run may have crossed terminal between admission and
+                // queue persistence. Retry once instead of creating an orphan
+                // directive with no owner for the repair loop to discover.
+                try
+                {
+                    admission = await coordinator.SubmitAsync(new FullDuplexInvocation(
+                        sessionId,
+                        content,
+                        clientMessageId!,
+                        permissionMode,
+                        targetRunId,
+                        expectedRev,
+                        invocationOverride,
+                        modeVersionId,
+                        QueueBehindActiveRun: true), ct).ConfigureAwait(false);
+                    admissionStatus = "queued";
+                }
+                catch (RunAdmissionException retry) when (retry.Code is "ACTIVE_RUN_LIMIT" or "SESSION_BUSY")
+                {
+                    runs = await lifecycle.ListRunsAsync(sessionId, ct).ConfigureAwait(false);
+                    activeRun = await QueueOwnerAsync(lifecycleDb, runs, ct).ConfigureAwait(false);
+                }
+            }
+
+            if (admission is null)
+            {
+                if (activeRun is null)
+                {
+                    return Results.Conflict(new
+                    {
+                        code = "queue_owner_changed",
+                        message = "The active run changed while the interaction was being queued. Retry the same client_message_id."
+                    });
+                }
+
+                var message = await conversations.AppendMessageAsync(
+                    sessionId,
+                    "user",
+                    content.Trim(),
+                    clientMessageId: clientMessageId,
+                    cancellationToken: ct).ConfigureAwait(false);
+                var queuedBind = await BindAttachmentsAsync(message.Id).ConfigureAwait(false);
+                if (queuedBind is not null) return queuedBind;
+                var directive = replay ?? new RunDirectiveRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = session.TenantId,
+                    WorkspaceId = session.WorkspaceId,
+                    SessionId = sessionId,
+                    Kind = "queued_interaction",
+                    Status = "pending",
+                    IdempotencyKey = idempotencyKey,
+                    CreatedAt = DateTimeOffset.UtcNow
+                };
+                directive.RunId = activeRun.Id;
+                directive.MessageId = message.Id;
+                directive.PayloadJson = JsonSerializer.Serialize(new
+                {
+                    content,
+                    client_message_id = clientMessageId,
+                    dispatch_mode = dispatchMode,
+                    mode_version_id = modeVersionId,
+                    permission_mode = permissionMode,
+                    meeting_model_override = meetingModelOverride is null
+                        ? null
+                        : new
+                        {
+                            provider_instance_id = meetingModelOverride.ProviderInstanceId,
+                            model = meetingModelOverride.Model
+                        }
+                });
+                directive.UpdatedAt = DateTimeOffset.UtcNow;
+                if (replay is null) lifecycleDb.RunDirectives.Add(directive);
+                await lifecycleDb.SaveChangesAsync(ct).ConfigureAwait(false);
+                await lifecycle.AppendEventAsync(activeRun.Id, "run.queued", new
+                {
+                    interaction_id = directive.Id,
+                    directive_id = directive.Id,
+                    message_id = message.Id,
+                    content,
+                    dispatch_mode = dispatchMode,
+                    mode_version_id = modeVersionId,
+                    permission_mode = permissionMode,
+                    meeting_model_override = meetingModelOverride
+                }, "Interaction queued behind the active run", "info", cancellationToken: ct).ConfigureAwait(false);
+                var overflowRevision = await conversations.GetContextRevisionAsync(sessionId, ct).ConfigureAwait(false);
+                var overflowCursor = await RunStreamCursorAsync(lifecycleDbFactory, activeRun.Id, ct).ConfigureAwait(false);
+                return Results.Created($"/api/v1/sessions/{sessionId}/interactions/{directive.Id}", new { interaction_id = directive.Id, session_id = sessionId, run_id = activeRun.Id, dispatch_mode = dispatchMode, status = "queued", mode_version_id = modeVersionId, meeting_model_override = meetingModelOverride, reason = ex.Message, client_message_id = clientMessageId, context_revision = overflowRevision, stream_cursor = overflowCursor, correlation_id = clientMessageId });
+            }
         }
         catch (RunAdmissionException ex) when (ex.Code == "CONTEXT_REVISION_CONFLICT")
         {
             return Results.Conflict(new { code = "context_conflict", message = ex.Message });
         }
+        catch (RunAdmissionException ex) when (ex.Code == "conversation_identity_locked_mismatch")
+        {
+            // The gate's own message names template slugs; the person reading it needs to know
+            // what happened and what to do instead. The raw text travels as `diagnostic`, not
+            // `detail`: the Gateway's problem mapping reads detail before message, so a raw
+            // detail would replace the sentence meant for the user.
+            return Results.Conflict(new
+            {
+                code = ex.Code,
+                message = "所选模式由另一位智能体负责和你对话，已经开始对话的会话不能中途更换它。请新建会话后再选择这个模式。",
+                diagnostic = ex.Message
+            });
+        }
+        catch (RunAdmissionException ex)
+        {
+            // Fail-closed admission rejections (graph_tier_lanes_unsupported,
+            // run freeze rules, spawn ceilings) surface as structured 409s with
+            // the snake_case code instead of a bare 500.
+            return Results.Conflict(new { code = ex.Code, message = ex.Message });
+        }
+        catch (InvalidDataException ex)
+        {
+            // 会话绑定/请求指定的 mode version 不可用（未发布、缺失、跨工作区、快照
+            // 损坏）时，roster 冻结在建 run 之前抛出。给用户结构化 409 与可操作的
+            // 提示，而不是裸 500 internal_error。
+            return Results.Conflict(new
+            {
+                code = "mode_unavailable",
+                message = "当前会话绑定的对话模式不可用，请在输入框左下角重新选择模式后重试。",
+                // Not `detail`: the Gateway would surface it in place of the message above.
+                diagnostic = ex.Message
+            });
+        }
         if (admission is null) return Results.Conflict(new { code = "conflict", message = "Admission failed" });
+        {
+            var admittedBind = await BindAttachmentsAsync(admission.MessageId).ConfigureAwait(false);
+            if (admittedBind is not null) return admittedBind;
+        }
         // if mode_version provided, store it as frozen binding hint (best-effort)
         if (modeVersionId.HasValue)
         {
@@ -195,7 +544,55 @@ public static class InteractionsEndpoints
             try { await lifecycle.AppendRunStreamAsync(admission.RunId, new DurableRunStreamAppend(admission.TurnId, dispatchMode == "parallel" ? "assigned" : "queued", admission.MessageId, IdempotencyKey: $"run:{admission.RunId}:turn:{admission.TurnId}:{dispatchMode}"), ct); } catch { }
         }
         var status = admissionStatus;
-        return Results.Created($"/api/v1/sessions/{sessionId}/interactions/{admission.TurnId}", new { interaction_id = admission.TurnId, session_id = sessionId, run_id = admission.RunId, turn_id = admission.TurnId, dispatch_mode = dispatchMode, status, mode_version_id = modeVersionId, meeting_model_override = meetingModelOverride });
+        var admissionCursor = await RunStreamCursorAsync(lifecycleDbFactory, admission.RunId, ct).ConfigureAwait(false);
+        return Results.Created($"/api/v1/sessions/{sessionId}/interactions/{admission.TurnId}", new { interaction_id = admission.TurnId, session_id = sessionId, run_id = admission.RunId, turn_id = admission.TurnId, dispatch_mode = dispatchMode, status, mode_version_id = modeVersionId, meeting_model_override = meetingModelOverride, client_message_id = clientMessageId, context_revision = admission.ContextRevision, stream_cursor = admissionCursor, correlation_id = clientMessageId });
+    }
+
+    private static IResult TinaChatInputLocked(HttpRequest request) => Results.Problem(
+        type: $"https://tinadec.dev/errors/{TinaChatInputLockedCode}",
+        title: TinaChatInputLockedCode,
+        statusCode: StatusCodes.Status403Forbidden,
+        detail: TinaChatInputLockedDetail,
+        instance: request.Path.Value,
+        extensions: new Dictionary<string, object?>
+        {
+            ["code"] = TinaChatInputLockedCode,
+            ["trace_id"] = request.HttpContext.TraceIdentifier
+        });
+
+    /// <summary>
+    /// The receipt cursor is the last assigned seq of the run's durable stream:
+    /// following from it continues the live stream without duplication; a client
+    /// that wants the full history opens the stream without a cursor.
+    /// </summary>
+    /// <summary>
+    /// Which unfinished run a queued message waits behind. The session's queue has one owner at a
+    /// time, so a run that already holds pending queued messages keeps receiving them (a new message
+    /// never jumps ahead of older ones held by another run); otherwise the newest unfinished run.
+    /// </summary>
+    private static async Task<RunRecord?> QueueOwnerAsync(LifecycleDbContext db, IReadOnlyList<RunRecord> runs, CancellationToken ct)
+    {
+        var active = runs.Where(run => run.Status is not ("completed" or "failed" or "cancelled")).ToList();
+        if (active.Count <= 1) return active.FirstOrDefault();
+        var ids = active.Select(run => (Guid?)run.Id).ToArray();
+        var owners = await db.RunDirectives.AsNoTracking()
+            .Where(x => x.Kind == "queued_interaction" && x.Status == "pending" && ids.Contains(x.RunId))
+            .Select(x => x.RunId)
+            .Distinct()
+            .ToListAsync(ct).ConfigureAwait(false);
+        // ListRunsAsync is newest first.
+        return active.FirstOrDefault(run => owners.Contains(run.Id)) ?? active[0];
+    }
+
+    static async Task<long> RunStreamCursorAsync(IDbContextFactory<LifecycleDbContext> factory, Guid? runId, CancellationToken ct)
+    {
+        if (runId is null) return 0;
+        await using var db = await factory.CreateDbContextAsync(ct).ConfigureAwait(false);
+        var next = await db.RunStreamCursors.AsNoTracking()
+            .Where(x => x.RunId == runId.Value)
+            .Select(x => (long?)x.NextSequence)
+            .FirstOrDefaultAsync(ct).ConfigureAwait(false);
+        return Math.Max(0, (next ?? 0) - 1);
     }
 
     static async Task<IResult> ReassignInteraction(Guid sessionId, Guid interactionId, HttpRequest req, StorageLifecycleService lifecycle, ITenantContextAccessor tenant, CancellationToken ct)
@@ -213,11 +610,31 @@ public static class InteractionsEndpoints
         return Results.Ok(new { interaction_id = interactionId, run_id = run.Id, dispatch_mode = newMode, status = "reassigned", target_run_id = targetRunId });
     }
 
-    static async Task<IResult> CancelInteraction(Guid sessionId, Guid interactionId, StorageLifecycleService lifecycle, IFullDuplexRunCoordinator coordinator, CancellationToken ct)
+    static async Task<IResult> CancelInteraction(Guid sessionId, Guid interactionId, StorageLifecycleService lifecycle, IFullDuplexRunCoordinator coordinator,
+        IDbContextFactory<LifecycleDbContext> lifecycleDbFactory, CancellationToken ct)
     {
         var runs = await lifecycle.ListRunsAsync(sessionId, ct);
         var run = runs.FirstOrDefault(r => r.TurnId == interactionId);
-        if (run is null) return Results.NotFound(new { code = "not_found" });
+        if (run is null)
+        {
+            // Not a run yet: a message still waiting in the session's queue (todo D1). Cancelling it
+            // takes it out of the queue; its text stays in the conversation as what the user said.
+            await using var db = await lifecycleDbFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
+            var now = DateTimeOffset.UtcNow;
+            var queued = await db.RunDirectives.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == interactionId && x.SessionId == sessionId && x.Kind == "queued_interaction", ct).ConfigureAwait(false);
+            if (queued is null) return Results.NotFound(new { code = "not_found" });
+            var cancelled = await db.RunDirectives
+                .Where(x => x.Id == interactionId && x.Status == "pending")
+                .ExecuteUpdateAsync(set => set.SetProperty(x => x.Status, "cancelled").SetProperty(x => x.DrainedAt, now).SetProperty(x => x.UpdatedAt, now), ct)
+                .ConfigureAwait(false);
+            if (cancelled == 1 && queued.RunId is { } owner)
+                await lifecycle.AppendEventAsync(owner, "interaction.queue_cancelled", new { interaction_id = interactionId, directive_id = interactionId },
+                    "A queued message was taken out of the queue.", "info", cancellationToken: ct).ConfigureAwait(false);
+            return cancelled == 1
+                ? Results.Ok(new { interaction_id = interactionId, run_id = queued.RunId, status = "cancelled", action = "dequeued" })
+                : Results.Conflict(new { code = "conflict", message = "The message already left the queue: it is running or was decided." });
+        }
         var res = await coordinator.ControlAsync(run.Id, new RunControlCommand("cancel", null, null), ct);
         return Results.Ok(new { interaction_id = interactionId, run_id = run.Id, status = res.Status, action = res.Action });
     }

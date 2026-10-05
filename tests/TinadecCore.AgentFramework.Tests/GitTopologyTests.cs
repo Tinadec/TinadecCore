@@ -3,11 +3,16 @@ using TinadecCore.Abstractions.Ports;
 using TinadecCore.Contracts.Dtos;
 using TinadecCore.DmaEA;
 using TinadecCore.Tools;
-using Tomlyn;
-using Tomlyn.Model;
+using System.Text.Json;
 
 namespace TinadecCore.AgentFramework.Tests;
 
+/// <summary>
+/// Git governance topology. Core ships no built-in roster any more: the shipped
+/// shape lives in the bootstrap fixture pack (installed through the regular pack
+/// pipeline), so these tests read that manifest instead of the retired TOML
+/// directory.
+/// </summary>
 public sealed class GitTopologyTests
 {
     [Fact]
@@ -16,25 +21,27 @@ public sealed class GitTopologyTests
         var (agents, modes) = LoadBootstrapDirectory();
 
         var steward = agents["git_steward"];
-        Assert.Equal("operation", (string)steward["layer"]);
-        Assert.Equal("git_steward", (string)steward["role"]);
-        Assert.Empty((TomlArray)steward["tools"]);
-        var stewardCapabilities = ((TomlArray)steward["capabilities"]).Cast<string>().ToArray();
+        Assert.Equal("operation", steward.GetProperty("layer").GetString());
+        Assert.Equal("git_steward", steward.GetProperty("role").GetString());
+        Assert.Empty(steward.GetProperty("tool_scope").EnumerateArray());
+        var stewardCapabilities = steward.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()!).ToArray();
         Assert.Contains("git.review", stewardCapabilities);
         Assert.Contains("git.commit_plan", stewardCapabilities);
         Assert.Contains("approval.request", stewardCapabilities);
 
         var worker = agents["worker.git"];
-        Assert.Equal("execution", (string)worker["layer"]);
-        Assert.Equal("git_specialist", (string)worker["role"]);
-        var workerTools = ((TomlArray)worker["tools"]).Cast<string>().ToArray();
+        Assert.Equal("execution", worker.GetProperty("layer").GetString());
+        Assert.Equal("git_specialist", worker.GetProperty("role").GetString());
+        var workerTools = worker.GetProperty("tool_scope").EnumerateArray().Select(value => value.GetString()!).ToArray();
         Assert.Contains("git_commit", workerTools);
         Assert.Contains("git_push", workerTools);
         Assert.Contains("git_worktree_create", workerTools);
         Assert.Contains("git_conflict_resolve", workerTools);
 
-        var defaultMode = modes.Single(mode => (string)mode["key"] == "default-mode");
-        var roster = ((TomlArray)defaultMode["agents"]).Cast<string>().ToArray();
+        var defaultMode = modes.Single(mode => mode.GetProperty("resource_key").GetString() == "default-mode");
+        var roster = defaultMode.GetProperty("nodes").EnumerateArray()
+            .Select(node => node.GetProperty("agent_ref").GetString()!.Replace("agent:", string.Empty, StringComparison.Ordinal))
+            .ToArray();
         Assert.Contains("git_steward", roster);
         Assert.Contains("worker.git", roster);
     }
@@ -43,7 +50,7 @@ public sealed class GitTopologyTests
     public void GitWorkerManifestIntersectionDoesNotGrantUnlistedTools()
     {
         var (agents, _) = LoadBootstrapDirectory();
-        var workerTools = ((TomlArray)agents["worker.git"]["tools"]).Cast<string>().ToArray();
+        var workerTools = agents["worker.git"].GetProperty("tool_scope").EnumerateArray().Select(value => value.GetString()!).ToArray();
         var manifest = new[] { "git_status", "git_diff", "git_commit", "git_push", "read_file" };
 
         var effective = workerTools
@@ -95,28 +102,58 @@ public sealed class GitTopologyTests
         }
     }
 
-    private static (Dictionary<string, TomlTable> Agents, List<TomlTable> Modes) LoadBootstrapDirectory()
+    [Fact]
+    public async Task ProjectlessSessionFreezesCoreCreateWorkspaceToolOnly()
     {
-        var path = Path.Combine(AppContext.BaseDirectory, "Configuration", "bootstrap-agent-directory.toml");
-        Assert.True(File.Exists(path), $"The bootstrap agent directory was not copied to '{path}'.");
-        var model = TomlSerializer.Deserialize<TomlTable>(File.ReadAllText(path));
-        var agents = new Dictionary<string, TomlTable>(StringComparer.Ordinal);
-        if (model.TryGetValue("agents", out var agentsValue) && agentsValue is TomlTableArray agentRows)
-            foreach (var table in agentRows.Cast<TomlTable>())
-                agents[(string)table["key"]] = table;
-        var modes = new List<TomlTable>();
-        if (model.TryGetValue("modes", out var modesValue) && modesValue is TomlTableArray modeRows)
-            modes.AddRange(modeRows.Cast<TomlTable>());
-        return (agents, modes);
+        var sessionId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+        var workspaceId = Guid.NewGuid();
+        // A free-conversation session carries no project; no provider is ever contacted.
+        var sessions = new StubSessionLocator(new SessionReference(sessionId, null, tenantId, workspaceId), null);
+        var provider = new StubToolProvider(new ToolManifestDto { ProtocolVersion = 2, ManifestHash = string.Empty, Tools = [] });
+        var resolver = new ToolManifestSnapshotResolver(sessions, provider);
+
+        var snapshot = await resolver.ResolveAsync(new ToolManifestSnapshotRequest(sessionId, ["create_workspace"], AllowAllTools: false));
+
+        Assert.Equal(2, snapshot.ProtocolVersion);
+        var tool = Assert.Single(snapshot.AuthorizedTools);
+        Assert.Equal("create_workspace", tool.Id);
+        Assert.True(tool.RequiresApproval);
+        Assert.True(tool.MutatesWorkspace);
+        Assert.Equal("high", tool.Risk);
+        Assert.False(string.IsNullOrWhiteSpace(snapshot.ManifestHash));
     }
 
-    private sealed class StubSessionLocator(SessionReference session, ProjectReference project) : ISessionLocator
+    /// <summary>
+    /// The shipped roster shape, read from the bootstrap fixture manifest that the
+    /// Api test host installs. Upsearch from the test output directory so the file
+    /// is read where it lives rather than copied into every test project.
+    /// </summary>
+    private static (Dictionary<string, JsonElement> Agents, List<JsonElement> Modes) LoadBootstrapDirectory()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var candidate = Path.Combine(
+                directory.FullName, "TinadecCore", "tests", "TinadecCore.Api.Tests", "Fixtures", "bootstrap-pack.json");
+            if (!File.Exists(candidate)) continue;
+            using var document = JsonDocument.Parse(File.ReadAllText(candidate));
+            var resources = document.RootElement.GetProperty("resources");
+            var agents = resources.GetProperty("agents").EnumerateArray()
+                .ToDictionary(agent => agent.GetProperty("resource_key").GetString()!, agent => agent.Clone(), StringComparer.Ordinal);
+            var modes = resources.GetProperty("modes").EnumerateArray().Select(mode => mode.Clone()).ToList();
+            return (agents, modes);
+        }
+        throw new FileNotFoundException(
+            "The bootstrap fixture manifest (TinadecCore/tests/TinadecCore.Api.Tests/Fixtures/bootstrap-pack.json) was not found from the test output directory.");
+    }
+
+    private sealed class StubSessionLocator(SessionReference session, ProjectReference? project) : ISessionLocator
     {
         public Task<SessionReference?> FindAsync(Guid sessionId, CancellationToken cancellationToken = default) =>
             Task.FromResult<SessionReference?>(session.SessionId == sessionId ? session : null);
 
         public Task<ProjectReference?> FindProjectAsync(Guid projectId, CancellationToken cancellationToken = default) =>
-            Task.FromResult<ProjectReference?>(project.ProjectId == projectId ? project : null);
+            Task.FromResult<ProjectReference?>(project is not null && project.ProjectId == projectId ? project : null);
     }
 
     private sealed class StubToolProvider(ToolManifestDto manifest) : IToolProvider
@@ -135,8 +172,12 @@ public sealed class GitTopologyTests
     {
         public Task<HashSet<string>?> GetEffectiveToolsForSessionAsync(Guid sessionId, CancellationToken cancellationToken = default) => Task.FromResult<HashSet<string>?>(tools);
 
+        public Task<HashSet<string>?> GetEffectiveToolsForModeAsync(Guid sessionId, Guid modeVersionId, CancellationToken cancellationToken = default) => Task.FromResult<HashSet<string>?>(tools);
+
         public Task<ChatResolution?> TryResolveFormalChatAsync(Guid sessionId, string layer, Guid runId, Guid turnId, CancellationToken cancellationToken = default) => Task.FromResult<ChatResolution?>(null);
 
         public Task<FormalModeRoster?> ResolveRosterAsync(Guid sessionId, CancellationToken cancellationToken = default) => Task.FromResult<FormalModeRoster?>(null);
+
+        public Task<FormalModeRoster?> ResolveRosterForModeAsync(Guid sessionId, Guid modeVersionId, CancellationToken cancellationToken = default) => Task.FromResult<FormalModeRoster?>(null);
     }
 }

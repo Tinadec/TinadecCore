@@ -77,10 +77,17 @@ public static class StorageEndpoints
 
         app.MapPost("/api/v1/sessions", async (CreateSessionRequest request, ProjectSessionStore store, IDbContextFactory<AgentConfigurationDbContext> cfgFactory, IAgentModelResolver modelResolver, ITenantContextAccessor tenant, CancellationToken ct) =>
         {
-            if (!Guid.TryParse(request.ProjectId, out var projectId)) return Results.BadRequest(new { code = "INVALID_PROJECT_ID" });
+            Guid? projectId = null;
+            if (!string.IsNullOrWhiteSpace(request.ProjectId))
+            {
+                if (!Guid.TryParse(request.ProjectId, out var parsedProjectId)) return Results.BadRequest(new { code = "INVALID_PROJECT_ID" });
+                projectId = parsedProjectId;
+            }
             try
             {
                 Guid? modeVersionId = request.ModeVersionId;
+                string? conversationNodeKey = null;
+                string? conversationTemplateSlug = null;
                 await using (var cfg = await cfgFactory.CreateDbContextAsync(ct).ConfigureAwait(false))
                 {
                     if (modeVersionId is null)
@@ -94,10 +101,29 @@ public static class StorageEndpoints
                     }
                     if (modeVersionId is null)
                         return Results.Conflict(new { code = "agent_mode_not_configured", message = "A published default Agent Mode must be configured before creating a session." });
-                    var published = await cfg.ModeVersions.AsNoTracking().AnyAsync(x => x.Id == modeVersionId
+                    var modeVersion = await cfg.ModeVersions.AsNoTracking().FirstOrDefaultAsync(x => x.Id == modeVersionId
                         && x.TenantId == tenant.Current.TenantId && x.WorkspaceId == tenant.Current.WorkspaceId
                         && x.Status == "published", ct).ConfigureAwait(false);
-                    if (!published) return Results.BadRequest(new { code = "invalid_mode_version", message = "mode_version_id must reference a published Agent Mode version." });
+                    if (modeVersion is null) return Results.BadRequest(new { code = "invalid_mode_version", message = "mode_version_id must reference a published Agent Mode version." });
+
+                    // ConversationIdentity (frozen at creation): resolve the mode node
+                    // carrying the conversation role — caller-requested node validated
+                    // against the resolution tiers, otherwise the designated node.
+                    var definitions = await cfg.AgentDefinitions.AsNoTracking()
+                        .Where(x => x.TenantId == tenant.Current.TenantId && x.WorkspaceId == tenant.Current.WorkspaceId)
+                        .Select(x => new TinadecCore.Runtime.ConversationIdentityResolver.DefinitionInput(x.Id, x.Slug, x.Layer, x.CapabilitiesJson))
+                        .ToListAsync(ct).ConfigureAwait(false);
+                    var identity = request.ConversationNodeKey is { } requestedKey
+                        ? TinadecCore.Runtime.ConversationIdentityResolver.ResolveRequested(requestedKey, modeVersion.SnapshotJson, definitions)
+                        : TinadecCore.Runtime.ConversationIdentityResolver.Resolve(modeVersion.SnapshotJson, definitions);
+                    if (identity is null)
+                    {
+                        return request.ConversationNodeKey is null
+                            ? Results.Conflict(new { code = "agent_mode_not_configured", message = "The selected Agent Mode does not declare a conversation node." })
+                            : Results.Json(new { code = "conversation_identity_invalid", message = $"conversation_node_key '{request.ConversationNodeKey}' is not a conversation-capable node of the selected mode." }, statusCode: StatusCodes.Status422UnprocessableEntity);
+                    }
+                    conversationNodeKey = identity.NodeKey;
+                    conversationTemplateSlug = identity.TemplateSlug;
                 }
                 SessionModelOverride? modelOverride = null;
                 if (request.MeetingModelOverride is { } requestedOverride)
@@ -107,7 +133,7 @@ public static class StorageEndpoints
                     await modelResolver.PreviewAsync(new ModelResolutionPreviewRequestDto { MeetingModelOverride = requestedOverride }, ct).ConfigureAwait(false);
                     modelOverride = new SessionModelOverride(requestedOverride.ProviderInstanceId, requestedOverride.Model);
                 }
-                var session = await store.CreateSessionAsync(projectId, request.Title, modeVersionId.Value, modelOverride, ct).ConfigureAwait(false);
+                var session = await store.CreateSessionAsync(projectId, request.Title, modeVersionId.Value, modelOverride, conversationNodeKey, conversationTemplateSlug, ct).ConfigureAwait(false);
                 return Results.Created($"/api/v1/sessions/{session.Id}", await ToSessionEnrichedAsync(session, cfgFactory, ct).ConfigureAwait(false));
             }
             catch (KeyNotFoundException) { return Results.NotFound(new { code = "PROJECT_NOT_FOUND" }); }
@@ -158,6 +184,37 @@ public static class StorageEndpoints
             catch (InvalidDataException ex) { return Results.BadRequest(new { code = "invalid_model_override", message = ex.Message }); }
         });
 
+        app.MapPost("/api/v1/sessions/{sessionId}/migrate", async (string sessionId, MigrateSessionRequest request, ProjectSessionStore store, IDbContextFactory<AgentConfigurationDbContext> cfgFactory, CancellationToken ct) =>
+        {
+            if (!Guid.TryParse(sessionId, out var id)) return Results.BadRequest(new { code = "INVALID_SESSION_ID" });
+            try
+            {
+                SessionRecord session;
+                if (!string.IsNullOrWhiteSpace(request.TargetProjectId) && Guid.TryParse(request.TargetProjectId, out var parsedId))
+                {
+                    session = await store.MigrateSessionAsync(id, parsedId, ct).ConfigureAwait(false);
+                }
+                else if (!string.IsNullOrWhiteSpace(request.ProjectName) && !string.IsNullOrWhiteSpace(request.ProjectPath))
+                {
+                    // The same binder the create_workspace virtual tool uses: directory
+                    // creation, absolute-path validation, find-or-create by root, and the
+                    // atomically locked session rebind must have exactly one implementation.
+                    var binding = await store.BindSessionToWorkspaceAsync(id, request.ProjectName, request.ProjectPath, ct).ConfigureAwait(false);
+                    session = await store.GetSessionAsync(binding.SessionId, ct).ConfigureAwait(false)
+                        ?? throw new KeyNotFoundException("Session was not found.");
+                }
+                else
+                {
+                    return Results.BadRequest(new { code = "INVALID_MIGRATION_REQUEST", message = "target_project_id or (project_name and project_path) must be provided." });
+                }
+
+                return Results.Ok(await ToSessionEnrichedAsync(session, cfgFactory, ct).ConfigureAwait(false));
+            }
+            catch (KeyNotFoundException) { return Results.NotFound(new { code = "RESOURCE_NOT_FOUND" }); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { code = "INVALID_REQUEST", message = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { code = "CONFLICT", message = ex.Message }); }
+        });
+
         MapSessionLifecycleEndpoints(app, "archive", lifecycle => lifecycle.ArchiveSessionAsync);
         MapSessionLifecycleEndpoints(app, "trash", lifecycle => lifecycle.TrashSessionAsync);
         MapSessionLifecycleEndpoints(app, "restore", lifecycle => lifecycle.RestoreSessionAsync);
@@ -175,10 +232,22 @@ public static class StorageEndpoints
             catch (TinadecCore.Runtime.ActiveRunConflictException ex) { return Results.Conflict(new { code = "active_run_conflict", message = ex.Message, run_id = ex.RunId }); }
         });
 
-        app.MapGet("/api/v1/sessions/{sessionId}/messages", async (string sessionId, ProjectSessionStore store, CancellationToken ct) =>
+        app.MapGet("/api/v1/sessions/{sessionId}/messages", async (string sessionId, ProjectSessionStore store, IMessageAttachmentStore attachments, CancellationToken ct) =>
         {
             if (!Guid.TryParse(sessionId, out var id)) return Results.BadRequest(new { code = "INVALID_SESSION_ID" });
-            try { return Results.Ok((await store.ListMessagesAsync(id, ct).ConfigureAwait(false)).Select(ToMessage)); }
+            try
+            {
+                var messages = await store.ListMessagesAsync(id, ct).ConfigureAwait(false);
+                // One listing for the whole page, grouped in memory: per-message reads would
+                // be one query per row on the route the chat hits every time it opens a
+                // session, and the store is already scoped to this tenant and workspace.
+                var claimed = (await attachments.ListAsync(id, ct).ConfigureAwait(false))
+                    .Where(row => row.MessageId is not null)
+                    .GroupBy(row => row.MessageId!.Value)
+                    .ToDictionary(group => group.Key, group => group.ToArray());
+                return Results.Ok(messages.Select(message => ToMessage(message,
+                    claimed.TryGetValue(message.Id, out var rows) ? rows : Array.Empty<StoredAttachment>())).ToArray());
+            }
             catch (KeyNotFoundException) { return Results.NotFound(new { code = "SESSION_NOT_FOUND" }); }
         });
 
@@ -188,6 +257,29 @@ public static class StorageEndpoints
             try { return Results.Created($"/api/v1/sessions/{id}/messages", ToMessage(await store.AddMessageAsync(id, request.Content, "user", null, ct).ConfigureAwait(false))); }
             catch (KeyNotFoundException) { return Results.NotFound(new { code = "SESSION_NOT_FOUND" }); }
             catch (ArgumentException ex) { return Results.BadRequest(new { code = "INVALID_MESSAGE", message = ex.Message }); }
+        });
+
+        // "Edit and resend": cut the conversation at one of its own messages so the
+        // corrected turn can be sent in its place. Rows stay durable — a run's trigger
+        // message, its checkpoint and the context snapshots all reference message ids —
+        // they simply stop being history, for the message list and the model alike.
+        app.MapPost("/api/v1/sessions/{sessionId}/messages/{messageId}/revert", async (string sessionId, string messageId, TinadecCore.Runtime.ProjectSessionLifecycleService lifecycle, CancellationToken ct) =>
+        {
+            if (!Guid.TryParse(sessionId, out var session)) return Results.BadRequest(new { code = "INVALID_SESSION_ID" });
+            if (!Guid.TryParse(messageId, out var message)) return Results.BadRequest(new { code = "INVALID_MESSAGE_ID" });
+            try
+            {
+                var reverted = await lifecycle.RevertSessionHistoryAsync(session, message, ct).ConfigureAwait(false);
+                return Results.Ok(new
+                {
+                    from_message_id = reverted.FromMessageId,
+                    from_sequence = reverted.FromSequence,
+                    removed_count = reverted.RemovedCount,
+                    history_revision = reverted.HistoryRevision
+                });
+            }
+            catch (KeyNotFoundException ex) { return Results.NotFound(new { code = "revert_target_not_found", message = ex.Message }); }
+            catch (TinadecCore.Runtime.ActiveRunConflictException ex) { return Results.Conflict(new { code = "active_run_conflict", message = ex.Message, run_id = ex.RunId }); }
         });
 
         app.MapGet("/api/v1/sessions/{sessionId}/runs", async (string sessionId, StorageLifecycleService lifecycle, CancellationToken ct) =>
@@ -321,7 +413,7 @@ public static class StorageEndpoints
     private static object ToSession(SessionRecord session) => new
     {
         id = session.Id, project_id = session.ProjectId, title = session.Title, status = session.Status,
-        mode = session.Mode, mode_version_id = session.ModeVersionId,
+        mode_version_id = session.ModeVersionId,
         meeting_model_override = ToMeetingModelOverride(session), summary = session.Summary,
         history_revision = session.HistoryRevision, created_at = session.CreatedAt, updated_at = session.UpdatedAt,
         lifecycle_status = session.LifecycleStatus, trashed_at = session.TrashedAt
@@ -345,14 +437,37 @@ public static class StorageEndpoints
             }
         }
         catch { }
-        return new { id = session.Id, project_id = session.ProjectId, title = session.Title, status = session.Status, mode = session.Mode, mode_version_id = session.ModeVersionId, meeting_model_override = ToMeetingModelOverride(session), has_update = hasUpdate, latest_mode_version_id = latestModeVersionId, summary = session.Summary, history_revision = session.HistoryRevision, created_at = session.CreatedAt, updated_at = session.UpdatedAt, lifecycle_status = session.LifecycleStatus, trashed_at = session.TrashedAt };
+        return new { id = session.Id, project_id = session.ProjectId, title = session.Title, status = session.Status, mode_version_id = session.ModeVersionId, conversation_node_key = session.ConversationNodeKey, conversation_template_slug = session.ConversationTemplateSlug, meeting_model_override = ToMeetingModelOverride(session), has_update = hasUpdate, latest_mode_version_id = latestModeVersionId, summary = session.Summary, history_revision = session.HistoryRevision, created_at = session.CreatedAt, updated_at = session.UpdatedAt, lifecycle_status = session.LifecycleStatus, trashed_at = session.TrashedAt };
     }
 
     private static object? ToMeetingModelOverride(SessionRecord session) =>
         session.MeetingModelOverrideProviderInstanceId is { } providerInstanceId
             ? new { provider_instance_id = providerInstanceId, model = session.MeetingModelOverrideModel }
             : null;
-    private static object ToMessage(StoredMessage message) => new { id = message.Id, session_id = message.SessionId, run_id = message.RunId, role = message.Role, content = message.Content, created_at = message.CreatedAt };
+    /// <summary>
+    /// attachments rides with the message so a reopened transcript shows what the user sent
+    /// without a second round-trip per row. content_reference deliberately does not: it is a
+    /// path under the data root, and the download route addresses bytes by attachment id.
+    /// </summary>
+    private static object ToMessage(StoredMessage message, IReadOnlyList<StoredAttachment>? attachments = null) => new
+    {
+        id = message.Id,
+        session_id = message.SessionId,
+        run_id = message.RunId,
+        role = message.Role,
+        content = message.Content,
+        created_at = message.CreatedAt,
+        attachments = (attachments ?? Array.Empty<StoredAttachment>()).Select(attachment => new
+        {
+            id = attachment.Id,
+            file_name = attachment.FileName,
+            media_type = attachment.MediaType,
+            content_length = attachment.ContentLength,
+            content_hash = attachment.ContentHash,
+            created_at = attachment.CreatedAt,
+            bound_at = attachment.BoundAt
+        }).ToArray()
+    };
     private static object ToRun(RunRecord run) => new { id = run.Id, session_id = run.SessionId, trigger_message_id = run.TriggerMessageId, status = run.Status, summary = run.Summary, task_revision = run.TaskRevision, latest_event_sequence = run.LastEventSequence, latest_event_at = run.LastEventAt, created_at = run.CreatedAt, updated_at = run.UpdatedAt, completed_at = run.CompletedAt };
 
     private static readonly TimeSpan EventFollowPollInterval = TimeSpan.FromMilliseconds(200);

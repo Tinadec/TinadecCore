@@ -1,11 +1,16 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using OpenAI;
 using System.ClientModel;
 using TinadecCore.Abstractions;
 using TinadecCore.Abstractions.Ports;
+using TinadecCore.Models.Harness;
+using TinadecCore.Models.Harness.Acp;
+using TinadecCore.Models.Harness.Headless;
+using TinadecCore.Models.Harness.Tui;
 using TinadecCore.Persistence;
 
 namespace TinadecCore.Models;
@@ -25,12 +30,51 @@ public sealed class ModelsModuleRegistrar : IModuleRegistrar
         builder.Services.AddSingleton<IModelProvider>(sp => sp.GetRequiredService<ModelProvider>());
         builder.Services.AddSingleton<IChatResolver>(sp => sp.GetRequiredService<ModelProvider>());
         builder.Services.AddSingleton<IEmbeddingProvider, EmbeddingProvider>();
+        // Everything a chat route can turn into a live client: the protocol-aware factory, the two local
+        // harness transports, the binary resolver, and the terminal host. This lives here rather than in
+        // DmaEA because reaching a model is the model interface's job, and DmaEA references only
+        // Abstractions and Persistence — so it consumes these through ports and cannot construct them.
+        builder.Services.AddSingleton<IAgentChatClientFactory>(sp => new AgentChatClientFactory(
+            sp.GetRequiredService<IChatResolver>(),
+            sp.GetRequiredService<IOpencodeServeProcessManager>(),
+            sp.GetRequiredService<IAcpSessionHost>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<AgentChatClientFactory>>(),
+            sp.GetRequiredService<IHarnessWorkspaceRoots>(),
+            sp.GetRequiredService<IHeadlessHarnessRunner>(),
+            sp.GetRequiredService<ITuiHarnessRunner>()));
+        // One governed working directory per provider instance, shared by every channel that spawns it.
+        // If each channel minted its own, the same harness would edit files in two different places
+        // depending on which channel a run happened to pick, and the directory is the boundary.
+        builder.Services.AddSingleton<IHarnessWorkspaceRoots, HarnessWorkspaceRoots>();
+        builder.Services.AddSingleton<IHeadlessHarnessRunner, ProcessHeadlessHarnessRunner>();
+        builder.Services.AddSingleton<ITuiHarnessRunner, ProcessTuiHarnessRunner>();
+        builder.Services.AddSingleton<OpencodeServeProcessManager>();
+        builder.Services.AddSingleton<IOpencodeServeProcessManager>(sp => sp.GetRequiredService<OpencodeServeProcessManager>());
+        // ACP sessions are hosted per provider instance and must die with the host, so the port is
+        // the concrete singleton: the same concrete-plus-port shape the opencode serve host uses. The
+        // interaction router is a factory because a router's pending approvals belong to one session,
+        // and Round 2 swaps what that factory returns without rewiring anything.
+        builder.Services.AddSingleton(sp => AcpSessionOptions.From(sp.GetService<IConfiguration>()));
+        builder.Services.AddSingleton<IAcpInteractionRouterFactory, RefusingAcpInteractionRouterFactory>();
+        builder.Services.AddSingleton<AcpSessionHost>();
+        builder.Services.AddSingleton<IAcpSessionHost>(sp => sp.GetRequiredService<AcpSessionHost>());
+        // The control plane proves a harness with a handshake. It goes through this port rather than
+        // the session host because the host's request type carries the spawn shape — argv and working
+        // directory — and those belong to the ACP layer, not to whichever caller wants a probe.
+        builder.Services.AddSingleton<IAcpHarnessProber, AcpHarnessProber>();
+        // The catalog is a compiled table of vendor facts and carries no machine state, so the tokens
+        // it stores ({UserProfile}, {LocalAppData}) are expanded here and nowhere else.
+        builder.Services.AddSingleton<IHarnessBinaryResolver, HarnessBinaryResolver>();
+        // The terminal host belongs here too: choosing and reaching a model backend is this module's
+        // job, and DmaEA may only consume a port. It cannot be shared with the copy inside
+        // TinadecTools, which is a separate executable with zero project references.
+        builder.Services.AddSingleton<IHarnessTerminalHost, ConPtyTerminalHost>();
         builder.RegisterModule(new ModuleDescriptor
         {
             ModuleId = ModuleId,
             Version = "0.1.0",
             Dependencies = ["abstractions", "persistence"],
-            Capabilities = ["provider_management", "model_routing", "credential_references", "error_normalization", "readiness", "embedding_generation"],
+            Capabilities = ["provider_management", "model_routing", "credential_references", "error_normalization", "readiness", "embedding_generation", "terminal_hosting", "harness_transports", "headless_harness_turns"],
             Language = "C#",
             MafPrimitives = ["agent", "chat_client"],
             RegistrationStatus = ModuleRegistrationStatus.NotConfigured
@@ -112,18 +156,27 @@ internal sealed class ModelProvider : IModelProvider, IChatResolver
         var configJson = await ReadContentAsync(providerVersion.ContentReference, cancellationToken).ConfigureAwait(false);
         using var doc = JsonDocument.Parse(configJson);
         string? String(string key) => doc.RootElement.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
-        var protocol = ChatProtocols.Normalize(String("protocol") ?? ChatProtocols.InferFromDriver(provider.Driver));
-        var isCli = protocol is ChatProtocols.Acp or ChatProtocols.OpencodeServe;
+        var protocol = HarnessCatalog.ResolveProtocol(String("protocol"), provider.Driver, String("channel"));
+        var processBacked = ChatProtocols.IsProcessTransport(protocol);
+        var harnessOwned = processBacked || protocol == ChatProtocols.OpencodeServe;
 
         var model = string.IsNullOrWhiteSpace(candidate.Model) ? String("model") : candidate.Model;
-        if (string.IsNullOrWhiteSpace(model) && !isCli) return Unavailable("Chat model name is not configured.");
+        if (string.IsNullOrWhiteSpace(model) && !harnessOwned) return Unavailable("Chat model name is not configured.");
         model ??= provider.Driver; // CLI runtimes select their own model; the route just names the runtime.
 
         string? baseUrl = null;
-        if (isCli)
+        if (processBacked)
+        {
+            // A stdio harness is reached by spawning it, so it has no endpoint to require. Demanding
+            // server_url here is what silently killed every ACP provider: the route reported
+            // "server_url is not configured" for a channel that never has one.
+            if (string.IsNullOrWhiteSpace(String("binary_path")))
+                return Unavailable($"Protocol '{protocol}' runs as a local process and needs binary_path; connect the harness first.");
+        }
+        else if (protocol == ChatProtocols.OpencodeServe)
         {
             baseUrl = String("server_url");
-            if (string.IsNullOrWhiteSpace(baseUrl)) return Unavailable("CLI provider server_url is not configured; connect the runtime first.");
+            if (string.IsNullOrWhiteSpace(baseUrl)) return Unavailable("CLI runtime server_url is not configured; connect the runtime first.");
         }
         else
         {
@@ -132,7 +185,7 @@ internal sealed class ModelProvider : IModelProvider, IChatResolver
         }
 
         string? apiKey = null;
-        if (!isCli)
+        if (!harnessOwned)
         {
             if (string.IsNullOrWhiteSpace(provider.SecretReference)) return Unavailable("Provider has no API key reference.");
             apiKey = await _secrets.GetAsync(provider.SecretReference, cancellationToken).ConfigureAwait(false);
@@ -144,6 +197,7 @@ internal sealed class ModelProvider : IModelProvider, IChatResolver
             IsAvailable = true,
             BaseUrl = baseUrl,
             Model = model,
+            Parameters = ModelParameters.ForModel(doc.RootElement, model),
             ApiKey = apiKey,
             ModelId = $"{provider.Driver}/{model}",
             Protocol = protocol,

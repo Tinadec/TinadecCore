@@ -6,7 +6,7 @@ using TinadecCore.Persistence;
 
 namespace TinadecCore.Memory;
 
-public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, IStorageMigrationParticipant
+public sealed class ProjectSessionStore : ISessionLocator, IWorkspaceRootResolver, IConversationStore, IStorageMigrationParticipant, ISessionWorkspaceBinder
 {
     private static readonly ConcurrentDictionary<Guid, SemaphoreSlim> SessionLocks = new();
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = false };
@@ -14,6 +14,13 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
     private readonly StoragePaths _paths;
     private readonly IContentStore _content;
     private readonly ITenantContextAccessor _tenantContext;
+
+    /// <summary>
+    /// Patch bodies are immutable once written, and a run's recent patches are read on every context
+    /// build of every agent in it; this keeps that from being one content-store read per patch per turn.
+    /// </summary>
+    private readonly ConcurrentDictionary<Guid, ConversationContextPatch> _patchBodies = new();
+    private const int PatchBodyCacheLimit = 4096;
 
     public ProjectSessionStore(IDbContextFactory<MemoryDbContext> dbFactory, StoragePaths paths, IContentStore content, ITenantContextAccessor tenantContext)
     {
@@ -30,11 +37,15 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
             throw new ArgumentException("Project name and path are required.");
         }
 
-        var rootPath = Path.GetFullPath(path.Trim());
-        if (!Path.IsPathRooted(rootPath))
+        // Rootedness is a property of the caller's input, not of GetFullPath's
+        // output (which always returns a rooted path), so check before normalizing.
+        var trimmedPath = path.Trim();
+        if (!Path.IsPathRooted(trimmedPath))
         {
             throw new ArgumentException("Project path must be absolute.");
         }
+
+        var rootPath = Path.GetFullPath(trimmedPath);
 
         var now = DateTimeOffset.UtcNow;
         var scope = _tenantContext.Current;
@@ -70,33 +81,64 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
     }
 
     public async Task<SessionRecord> CreateSessionAsync(
-        Guid projectId,
+        Guid? projectId,
         string? title,
         Guid modeVersionId,
         SessionModelOverride? meetingModelOverride = null,
-        CancellationToken cancellationToken = default)
+        string? conversationNodeKey = null,
+        string? conversationTemplateSlug = null,
+        CancellationToken cancellationToken = default,
+        Guid? stableSessionId = null)
     {
         await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var scope = _tenantContext.Current;
-        if (!await db.Projects.AnyAsync(x => x.Id == projectId && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId && x.LifecycleStatus == LifecycleStatuses.Active, cancellationToken).ConfigureAwait(false))
+        if (projectId.HasValue && !await db.Projects.AnyAsync(x => x.Id == projectId.Value && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId && x.LifecycleStatus == LifecycleStatuses.Active, cancellationToken).ConfigureAwait(false))
         {
             throw new KeyNotFoundException("Project was not found.");
         }
 
         var now = DateTimeOffset.UtcNow;
         if (modeVersionId == Guid.Empty) throw new ArgumentException("A published Agent Mode version is required.", nameof(modeVersionId));
+        if (stableSessionId == Guid.Empty) throw new ArgumentException("Stable session id must not be empty.", nameof(stableSessionId));
+        if (stableSessionId is { } existingId)
+        {
+            var existing = await db.Sessions.AsNoTracking().SingleOrDefaultAsync(x => x.Id == existingId, cancellationToken).ConfigureAwait(false);
+            if (existing is not null) return ValidateBoundSession(existing);
+        }
         var session = new SessionRecord
         {
-            Id = Guid.NewGuid(), TenantId = scope.TenantId, WorkspaceId = scope.WorkspaceId,
+            Id = stableSessionId ?? Guid.NewGuid(), TenantId = scope.TenantId, WorkspaceId = scope.WorkspaceId,
             ProjectId = projectId, Title = string.IsNullOrWhiteSpace(title) ? "New session" : title.Trim(),
             ModeVersionId = modeVersionId,
             MeetingModelOverrideProviderInstanceId = meetingModelOverride?.ProviderInstanceId,
             MeetingModelOverrideModel = meetingModelOverride?.Model,
+            ConversationNodeKey = conversationNodeKey,
+            ConversationTemplateSlug = conversationTemplateSlug,
             CreatedAt = now, UpdatedAt = now
         };
         db.Sessions.Add(session);
-        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateException) when (stableSessionId.HasValue)
+        {
+            db.ChangeTracker.Clear();
+            var winner = await db.Sessions.AsNoTracking().SingleOrDefaultAsync(x => x.Id == stableSessionId.Value, cancellationToken).ConfigureAwait(false);
+            if (winner is null) throw;
+            return ValidateBoundSession(winner);
+        }
         return session;
+
+        SessionRecord ValidateBoundSession(SessionRecord existing)
+        {
+            if (existing.TenantId != scope.TenantId || existing.WorkspaceId != scope.WorkspaceId
+                || existing.ProjectId != projectId || existing.ModeVersionId != modeVersionId
+                || existing.ConversationNodeKey != conversationNodeKey || existing.ConversationTemplateSlug != conversationTemplateSlug
+                || existing.LifecycleStatus != LifecycleStatuses.Active)
+                throw new InvalidOperationException("The stable session identifier is already bound to different inputs.");
+            return existing;
+        }
     }
 
     public async Task<IReadOnlyList<SessionRecord>> ListSessionsAsync(Guid? projectId, string lifecycleStatus = LifecycleStatuses.Active, CancellationToken cancellationToken = default)
@@ -148,6 +190,136 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
         session.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return session;
+    }
+
+    /// <summary>
+    /// Re-freezes the conversation identity while the session holds no message yet.
+    ///
+    /// The identity is frozen so that everything already said in a conversation stays
+    /// attributable to the one agent that said it. Before the first message there is nothing
+    /// to attribute, so the mode the first message is sent in decides who converses. Without
+    /// this, a session created on the workspace default (or by a New Session click before the
+    /// user picked a mode) could never start in a mode whose conversation is held by a
+    /// different agent. Returns false and changes nothing once any message exists.
+    /// </summary>
+    public async Task<bool> AdoptConversationIdentityIfEmptyAsync(
+        Guid sessionId,
+        string conversationNodeKey,
+        string conversationTemplateSlug,
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var scope = _tenantContext.Current;
+        var session = await db.Sessions.SingleOrDefaultAsync(x => x.Id == sessionId && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId && x.LifecycleStatus == LifecycleStatuses.Active, cancellationToken).ConfigureAwait(false);
+        if (session is null) return false;
+        if (await db.Messages.AnyAsync(x => x.SessionId == sessionId, cancellationToken).ConfigureAwait(false)) return false;
+        session.ConversationNodeKey = conversationNodeKey;
+        session.ConversationTemplateSlug = conversationTemplateSlug;
+        session.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>
+    /// Moves the session's conversation identity to another agent (todo E6): with the modes
+    /// converging on one conversation identity, a session frozen on a legacy identity may move —
+    /// but ONLY while no run is active (the caller's check): an in-flight run freezes its roster
+    /// against the identity it started with, so moving underfoot would strand it at resume.
+    /// Returns false when the session does not exist or is not active.
+    /// </summary>
+    public async Task<bool> MigrateConversationIdentityAsync(
+        Guid sessionId,
+        string conversationNodeKey,
+        string conversationTemplateSlug,
+        CancellationToken cancellationToken = default)
+    {
+        var gate = SessionLocks.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            var scope = _tenantContext.Current;
+            var session = await db.Sessions.SingleOrDefaultAsync(x => x.Id == sessionId && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId && x.LifecycleStatus == LifecycleStatuses.Active, cancellationToken).ConfigureAwait(false);
+            if (session is null) return false;
+            session.ConversationNodeKey = conversationNodeKey;
+            session.ConversationTemplateSlug = conversationTemplateSlug;
+            session.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    public async Task<SessionRecord> MigrateSessionAsync(
+        Guid sessionId,
+        Guid targetProjectId,
+        CancellationToken cancellationToken = default)
+    {
+        // Rebinding a session is a read-modify-write on one row; without the gate a
+        // concurrent migrate/create_workspace pair can lose the winning update.
+        var gate = SessionLocks.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await MigrateSessionUnlockedAsync(sessionId, targetProjectId, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<SessionRecord> MigrateSessionUnlockedAsync(
+        Guid sessionId,
+        Guid targetProjectId,
+        CancellationToken cancellationToken)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var scope = _tenantContext.Current;
+        var session = await db.Sessions.SingleOrDefaultAsync(x => x.Id == sessionId && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId && x.LifecycleStatus == LifecycleStatuses.Active, cancellationToken).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException("Session was not found.");
+
+        if (!await db.Projects.AnyAsync(x => x.Id == targetProjectId && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId && x.LifecycleStatus == LifecycleStatuses.Active, cancellationToken).ConfigureAwait(false))
+        {
+            throw new KeyNotFoundException("Target project was not found.");
+        }
+
+        session.ProjectId = targetProjectId;
+        session.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return session;
+    }
+
+    public async Task<SessionWorkspaceBinding> BindSessionToWorkspaceAsync(Guid sessionId, string name, string path, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Workspace name is required.");
+        if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Workspace path is required.");
+        // Rootedness must be checked on the caller-supplied value: GetFullPath
+        // normalizes a relative path against the process CWD, so checking it after
+        // the call can never fail.
+        var trimmedPath = path.Trim();
+        if (!Path.IsPathRooted(trimmedPath)) throw new ArgumentException("Workspace path must be absolute.");
+        var fullPath = Path.GetFullPath(trimmedPath);
+        // Find-or-create plus the session rebind must be one critical section per
+        // session: a double-clicked approval or retried dispatch otherwise races
+        // two create_workspace calls and the loser silently overwrites the winner.
+        var gate = SessionLocks.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            Directory.CreateDirectory(fullPath);
+            var existing = await FindByRootAsync(fullPath, cancellationToken).ConfigureAwait(false);
+            var projectId = existing?.ProjectId ?? (await CreateProjectAsync(name, fullPath, cancellationToken).ConfigureAwait(false)).Id;
+            var session = await MigrateSessionUnlockedAsync(sessionId, projectId, cancellationToken).ConfigureAwait(false);
+            return new SessionWorkspaceBinding(session.Id, projectId, name.Trim(), Path.TrimEndingDirectorySeparator(fullPath), existing is null);
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     public async Task<ProjectRecord?> RenameProjectAsync(Guid projectId, string name, CancellationToken cancellationToken = default)
@@ -258,7 +430,12 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
     {
         await EnsureSessionExistsAsync(sessionId, cancellationToken).ConfigureAwait(false);
         await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-        var rows = await db.Messages.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.Sequence).ToListAsync(cancellationToken).ConfigureAwait(false);
+        // An edited-away turn keeps its row (runs, checkpoints and context snapshots
+        // still reference those message ids) but must never come back into the
+        // conversation. The filter lives here so every reader — the UI list, the model
+        // context and the limited overload below — agrees on what the history is.
+        var rows = await db.Messages.AsNoTracking().Where(x => x.SessionId == sessionId && x.RevertedAt == null)
+            .OrderBy(x => x.Sequence).ToListAsync(cancellationToken).ConfigureAwait(false);
         var result = new List<StoredMessage>(rows.Count);
         foreach (var row in rows) result.Add(await ToStoredMessageAsync(row, cancellationToken).ConfigureAwait(false));
         return result;
@@ -269,7 +446,12 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
 
     public async Task<StoredMessage> AddMessageAsync(Guid sessionId, string content, string role, Guid? runId, Guid? turnId, string? clientMessageId, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(content)) throw new ArgumentException("Message content is required.");
+        // Null is a caller that has nothing to say; an explicitly empty body is a turn whose
+        // content is not text. The only such turn today is an attachment-only message, where
+        // the bytes live in a bound attachment row and the body is honestly empty rather than
+        // missing. Anything that should have words and does not is refused at the interaction
+        // boundary, which is the place that can tell the two apart.
+        if (content is null) throw new ArgumentException("Message content is required.");
         var sessionRef = await FindAsync(sessionId, cancellationToken).ConfigureAwait(false) ?? throw new KeyNotFoundException("Session was not found.");
         var gate = SessionLocks.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -344,6 +526,48 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
         return messages.TakeLast(Math.Max(0, limit ?? messages.Count)).Select(ToConversationMessage).ToArray();
     }
 
+    Task<SessionHistoryRevert> IConversationStore.RevertHistoryAsync(Guid sessionId, Guid fromMessageId, CancellationToken cancellationToken) =>
+        RevertHistoryAsync(sessionId, fromMessageId, cancellationToken);
+
+    /// <summary>
+    /// Marks the given message and everything after it as edited away. Rows are not
+    /// deleted: a run's trigger message, its checkpoint and the context snapshots all
+    /// reference message ids, so deleting them would wedge recovery instead of editing
+    /// the conversation. The marker is per row rather than a sequence cutoff because a
+    /// cutoff would also hide the resend that follows the edit.
+    /// </summary>
+    public async Task<SessionHistoryRevert> RevertHistoryAsync(Guid sessionId, Guid fromMessageId, CancellationToken cancellationToken = default)
+    {
+        var gate = SessionLocks.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            var scope = _tenantContext.Current;
+            var session = await db.Sessions.SingleOrDefaultAsync(x => x.Id == sessionId
+                && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId, cancellationToken).ConfigureAwait(false)
+                ?? throw new KeyNotFoundException("Session was not found.");
+            var from = await db.Messages.AsNoTracking().SingleOrDefaultAsync(x => x.Id == fromMessageId && x.SessionId == sessionId
+                && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId, cancellationToken).ConfigureAwait(false)
+                ?? throw new KeyNotFoundException("Message was not found in this session.");
+            var revertedAt = DateTimeOffset.UtcNow;
+            var removed = await db.Messages
+                .Where(x => x.SessionId == sessionId
+                    && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId
+                    && x.Sequence >= from.Sequence && x.RevertedAt == null)
+                .ExecuteUpdateAsync(set => set.SetProperty(x => x.RevertedAt, revertedAt), cancellationToken)
+                .ConfigureAwait(false);
+            session.HistoryRevision++;
+            session.UpdatedAt = revertedAt;
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            return new SessionHistoryRevert(fromMessageId, from.Sequence, removed, session.HistoryRevision);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
     async Task<ConversationMessage?> IConversationStore.FindMessageByClientMessageIdAsync(Guid sessionId, string clientMessageId, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(clientMessageId))
@@ -399,10 +623,20 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
         patchRows.Sort((a, b) => b.CreatedAt.CompareTo(a.CreatedAt));
         if (patchRows.Count > bounded) patchRows.RemoveRange(bounded, patchRows.Count - bounded);
 
+        // Patch kind lives in the immutable content body; resolve it so the
+        // metadata projection distinguishes supplements, goal adjustments, and
+        // operational compactions without exposing the body itself.
+        var patchVersions = new List<ConversationContextVersion>(patchRows.Count);
+        foreach (var row in patchRows)
+        {
+            var patch = await ReadContextPatchAsync(row, cancellationToken).ConfigureAwait(false);
+            patchVersions.Add(new ConversationContextVersion(
+                row.Id, row.SessionId, row.RunId, row.AppliedRevision ?? row.BaseRevision, patch.Kind, row.Status, row.BaseRevision, row.CreatedAt));
+        }
+
         return snapshotRows.Select(item => new ConversationContextVersion(
                 item.Id, item.SessionId, item.RunId, item.Revision, "snapshot", "applied", null, item.CreatedAt))
-            .Concat(patchRows.Select(item => new ConversationContextVersion(
-                item.Id, item.SessionId, item.RunId, item.AppliedRevision ?? item.BaseRevision, "patch", item.Status, item.BaseRevision, item.CreatedAt)))
+            .Concat(patchVersions)
             .OrderByDescending(item => item.Revision)
             .ThenByDescending(item => item.CreatedAt)
             .Take(Math.Clamp(limit, 1, 200))
@@ -418,9 +652,9 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
             throw new ArgumentException("Context patch content is required.", nameof(request));
         }
         var patchKind = request.Kind?.Trim().ToLowerInvariant();
-        if (patchKind is not ("supplement" or "goal_adjustment"))
+        if (patchKind is not ("supplement" or "goal_adjustment" or "compaction"))
         {
-            throw new ArgumentException("Context patch kind must be supplement or goal_adjustment.", nameof(request));
+            throw new ArgumentException("Context patch kind must be supplement, goal_adjustment, or compaction.", nameof(request));
         }
 
         var sessionRef = await FindAsync(request.SessionId, cancellationToken).ConfigureAwait(false)
@@ -530,6 +764,41 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
         return patches;
     }
 
+    public async Task<IReadOnlyList<ConversationContextPatch>> ListRecentContextPatchesAsync(
+        Guid sessionId,
+        Guid? runId,
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        if (limit <= 0) return [];
+        var scope = _tenantContext.Current;
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var rows = await db.ContextPatches.AsNoTracking()
+            .Where(item => item.SessionId == sessionId
+                && (runId == null || item.RunId == runId)
+                && item.TenantId == scope.TenantId
+                && item.WorkspaceId == scope.WorkspaceId
+                && item.Status == "applied"
+                && item.AppliedRevision != null)
+            .OrderByDescending(item => item.AppliedRevision)
+            .Take(limit)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        rows.Reverse();
+
+        var patches = new List<ConversationContextPatch>(rows.Count);
+        foreach (var row in rows)
+        {
+            if (!_patchBodies.TryGetValue(row.Id, out var patch))
+            {
+                patch = await ReadContextPatchAsync(row, cancellationToken).ConfigureAwait(false);
+                if (_patchBodies.Count >= PatchBodyCacheLimit) _patchBodies.Clear();
+                _patchBodies[row.Id] = patch;
+            }
+            patches.Add(patch);
+        }
+        return patches;
+    }
+
     public async Task<TurnRecord> CreateTurnAsync(Guid sessionId, Guid userMessageId, string kind, long baseContextRevision, CancellationToken cancellationToken = default)
     {
         var session = await FindAsync(sessionId, cancellationToken).ConfigureAwait(false) ?? throw new KeyNotFoundException("Session was not found.");
@@ -601,7 +870,9 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
                 x.Id, x.ProjectId, x.TenantId, x.WorkspaceId, x.ModeVersionId,
                 x.MeetingModelOverrideProviderInstanceId == null
                     ? null
-                    : new SessionModelOverride(x.MeetingModelOverrideProviderInstanceId.Value, x.MeetingModelOverrideModel)))
+                    : new SessionModelOverride(x.MeetingModelOverrideProviderInstanceId.Value, x.MeetingModelOverrideModel),
+                x.ConversationNodeKey,
+                x.ConversationTemplateSlug))
             .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -611,6 +882,31 @@ public sealed class ProjectSessionStore : ISessionLocator, IConversationStore, I
         var scope = _tenantContext.Current;
         return await db.Projects.AsNoTracking()
             .Where(x => x.Id == projectId && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId && x.LifecycleStatus == LifecycleStatuses.Active)
+            .Select(x => new ProjectReference(x.Id, x.TenantId, x.WorkspaceId, x.RootPath))
+            .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<ProjectReference?> FindByRootAsync(string cwd, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(cwd)) return null;
+
+        string normalized;
+        try
+        {
+            normalized = NormalizeRootPath(cwd.Trim());
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
+
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var scope = _tenantContext.Current;
+        return await db.Projects.AsNoTracking()
+            .Where(x => x.TenantId == scope.TenantId
+                && x.WorkspaceId == scope.WorkspaceId
+                && x.LifecycleStatus == LifecycleStatuses.Active
+                && x.NormalizedRootPath == normalized)
             .Select(x => new ProjectReference(x.Id, x.TenantId, x.WorkspaceId, x.RootPath))
             .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
     }

@@ -33,11 +33,45 @@ public interface ILifecycleManager
         string runId,
         CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Atomically claims the successful terminal outcome while keeping the run in
+    /// a lease-eligible non-terminal status until its user-visible artifacts are
+    /// durable. False means another terminal outcome or an earlier completion
+    /// claim already won.
+    /// </summary>
+    Task<bool> TryClaimRunCompletionAsync(
+        string runId,
+        string expectedStatus,
+        string? expectedLeaseOwner,
+        int? expectedRecoveryCount,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult(false);
+
     Task SetRunStatusAsync(
         string runId,
         string status,
         string? summary = null,
         CancellationToken cancellationToken = default);
+
+    Task SetRunStatusUnderLeaseAsync(
+        string runId,
+        string status,
+        string? summary,
+        string expectedLeaseOwner,
+        int expectedRecoveryCount,
+        CancellationToken cancellationToken = default) =>
+        Task.FromException(new NotSupportedException(
+            "This lifecycle implementation does not support lease-fenced run status transitions."));
+
+    Task SetRunFailedUnderLeaseAsync(
+        string runId,
+        string summary,
+        string errorCategory,
+        string expectedLeaseOwner,
+        int expectedRecoveryCount,
+        CancellationToken cancellationToken = default) =>
+        Task.FromException(new NotSupportedException(
+            "This lifecycle implementation does not support lease-fenced terminal transitions."));
 
     Task<int> CountActiveRunsAsync(string sessionId, CancellationToken cancellationToken = default);
 
@@ -63,7 +97,8 @@ public interface ILifecycleManager
         Guid? taskId = null,
         Guid? approvalId = null,
         string? toolId = null,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        string? idempotencyKey = null);
 
     Task<string> StartToolExecutionAsync(
         ToolExecutionStart start,
@@ -81,6 +116,14 @@ public interface ILifecycleManager
         CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<RunState>> ListNonTerminalRunsAsync(
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// One session's unfinished runs, newest first — including runs parked on a decision, which
+    /// the admission limit does not count but a queued message still waits behind.
+    /// </summary>
+    Task<IReadOnlyList<RunState>> ListActiveRunsAsync(
+        Guid sessionId,
         CancellationToken cancellationToken = default);
 
     /// <summary>Lists non-terminal runs that are not held by a live execution lease.</summary>
@@ -106,6 +149,41 @@ public interface ILifecycleManager
 
     Task<RunCheckpoint?> GetCurrentRunCheckpointAsync(
         string runId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Pending orchestration directives aimed at one run, oldest first. The
+    /// pending-status filter is the resume mechanism, so draining marks rows
+    /// instead of deleting them.
+    /// </summary>
+    Task<IReadOnlyList<RunDirective>> ListPendingRunDirectivesAsync(
+        Guid runId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Marks the given still-pending directives as drained or rejected.</summary>
+    Task<RunDirectiveDrainResult> DrainRunDirectivesAsync(
+        Guid runId,
+        IReadOnlyList<Guid> directiveIds,
+        string drainedStatus,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Moves still-pending directives from one run to another run of the same session, keeping
+    /// their creation order: how a queue of messages waits behind whichever run the session is
+    /// working on now. Returns how many moved.
+    /// </summary>
+    Task<int> RequeueRunDirectivesAsync(
+        Guid fromRunId,
+        IReadOnlyList<Guid> directiveIds,
+        Guid toRunId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Queues a durable orchestration directive aimed at one run. An exact
+    /// idempotency-key replay returns the stored row instead of inserting.
+    /// </summary>
+    Task<RunDirective> EnqueueRunDirectiveAsync(
+        RunDirectiveWrite write,
         CancellationToken cancellationToken = default);
 
     Task<RunLease> TryAcquireRunLeaseAsync(
@@ -157,12 +235,13 @@ public sealed record RunState
     public long ContextRevision { get; init; }
     public long ConfigurationVersion { get; init; }
     public string ConfigurationHash { get; init; } = string.Empty;
-    public string ApplicationMode { get; init; } = "conversation";
-    public string AgentMode { get; init; } = "auto";
     public string PermissionMode { get; init; } = "default";
-    public string RuntimeProfileId { get; init; } = "conversation.auto";
+    public string RuntimeProfileId { get; init; } = string.Empty;
     public string? TenantId { get; init; }
     public string? WorkspaceId { get; init; }
+    public string? ParentRunId { get; init; }
+    public string? ParentTaskId { get; init; }
+    public string RunKind { get; init; } = "root";
     /// <summary>Immutable principal that admitted the run. Empty means legacy runs cannot authorize tools.</summary>
     public string? InitiatedByPrincipalId { get; init; }
     public long CheckpointRevision { get; init; }
@@ -172,9 +251,30 @@ public sealed record RunState
     public DateTimeOffset? LeaseHeartbeatAt { get; init; }
     public int RecoveryCount { get; init; }
     public string? Summary { get; init; }
+    public string? TerminalErrorCategory { get; init; }
     public DateTimeOffset StartedAt { get; init; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? CompletedAt { get; init; }
 }
+
+/// <summary>A durable orchestration directive row projected for the engine.</summary>
+public sealed record RunDirective(
+    Guid Id,
+    Guid SessionId,
+    string Kind,
+    string PayloadJson,
+    string? IdempotencyKey);
+
+/// <summary>Outcome of a drain batch.</summary>
+public sealed record RunDirectiveDrainResult(int DrainedCount);
+
+/// <summary>Values for queueing a new orchestration directive at one target run.</summary>
+public sealed record RunDirectiveWrite(
+    Guid TargetRunId,
+    Guid SessionId,
+    Guid? MessageId,
+    string Kind,
+    string PayloadJson,
+    string? IdempotencyKey);
 
 /// <summary>Immutable values captured when a full-duplex run is admitted.</summary>
 public sealed record RunStartRequest(
@@ -184,11 +284,12 @@ public sealed record RunStartRequest(
     long ContextRevision = 0,
     long ConfigurationVersion = 0,
     string ConfigurationHash = "",
-    string ApplicationMode = "conversation",
-    string AgentMode = "auto",
     string PermissionMode = "default",
-    string RuntimeProfileId = "conversation.auto",
-    string? InitiatedByPrincipalId = null);
+    string RuntimeProfileId = "",
+    string? InitiatedByPrincipalId = null,
+    string? ParentRunId = null,
+    string? ParentTaskId = null,
+    string RunKind = "root");
 
 /// <summary>Values captured when a tool call is dispatched to the tool layer.</summary>
 public sealed record ToolExecutionStart(

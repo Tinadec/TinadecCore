@@ -32,7 +32,38 @@ public sealed class ToolManifestSnapshotResolver : IToolManifestSnapshotResolver
 
         var session = await _sessions.FindAsync(request.SessionId, cancellationToken).ConfigureAwait(false)
             ?? throw new KeyNotFoundException("Session was not found.");
-        var project = await _sessions.FindProjectAsync(session.ProjectId, cancellationToken).ConfigureAwait(false)
+
+        if (session.ProjectId is null)
+        {
+            // Free-conversation sessions have no TinadecTools child process, so no
+            // live manifest exists to freeze. The frozen manifest carries only the
+            // Core-owned create_workspace virtual tool: a worker may propose binding
+            // a real workspace (approval-gated, executed by Core itself), and the
+            // next interaction freezes a fresh manifest from the new project root.
+            //
+            // This synthetic entry is the run's tool *ceiling*, not a per-agent
+            // grant: unlike the project path it is not intersected with each agent's
+            // declared tool_scope, because the projectless ceiling must stay
+            // resolvable on installs whose published mode predates create_workspace.
+            // The per-agent boundary is still enforced downstream — every invocation
+            // passes ToolInvocationScopeResolver.IsToolAllowed(instance grant) and the
+            // model only ever sees IFrozenToolManifestCatalog (instance grant ∩ this
+            // frozen manifest), so an agent that does not declare the tool cannot
+            // reach it.
+            var projectlessEntries = new List<ToolManifestEntryDto> { CoreWorkspaceTool.ManifestEntry() };
+            // Any other Core-owned virtual tool the run declared must be frozen in here too.
+            // Free conversation is the common shape for a chatroom handoff session, and dropping
+            // a declared tool would leave the agent holding a declaration it can never see.
+            foreach (var id in (request.AllowedToolIds ?? [])
+                         .Where(CoreVirtualToolPolicy.IsCoreVirtual)
+                         .Where(id => !CoreVirtualToolPolicy.IsCreateWorkspace(id))
+                         .Distinct(StringComparer.OrdinalIgnoreCase))
+                projectlessEntries.Add(VirtualEntry(id));
+            var virtualHash = ToolManifestHasher.Compute(projectlessEntries);
+            return new ToolManifestSnapshot(2, virtualHash, projectlessEntries.Select(ToFrozen).ToArray());
+        }
+
+        var project = await _sessions.FindProjectAsync(session.ProjectId.Value, cancellationToken).ConfigureAwait(false)
             ?? throw new KeyNotFoundException("Project was not found.");
         if (project.TenantId != session.TenantId || project.WorkspaceId != session.WorkspaceId)
             throw new ToolManifestSnapshotException("TOOL_MANIFEST_SCOPE_MISMATCH", "The project does not belong to the session workspace.");
@@ -90,12 +121,43 @@ public sealed class ToolManifestSnapshotResolver : IToolManifestSnapshotResolver
         {
             var formal = _services?.GetService(typeof(IFormalModeResolver)) as IFormalModeResolver;
             if (formal is not null)
-                formalEffective = await formal.GetEffectiveToolsForSessionAsync(request.SessionId, cancellationToken).ConfigureAwait(false);
+                formalEffective = request.ModeVersionId is { } modeVersionId
+                    ? await formal.GetEffectiveToolsForModeAsync(request.SessionId, modeVersionId, cancellationToken).ConfigureAwait(false)
+                    : await formal.GetEffectiveToolsForSessionAsync(request.SessionId, cancellationToken).ConfigureAwait(false);
         }
         catch { }
 
+        // Graph-tier spawnable templates are not roster nodes, so their tool
+        // ceilings never appear in the mode's effective-tool union — yet the
+        // spawned workers need them authorized. Join them into the authoritative
+        // set (they are still trimmed to the live manifest offering below).
+        if (formalEffective is { } effective && !effective.Contains("*")
+            && request.SpawnableToolIds is { } spawnableToolIds && spawnableToolIds.Count > 0)
+        {
+            formalEffective = effective
+                .Union(spawnableToolIds, StringComparer.OrdinalIgnoreCase)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+
         var byId = manifest.Tools.ToDictionary(item => item.Id, StringComparer.OrdinalIgnoreCase);
         var available = manifest.Tools.Select(item => item.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Core-owned virtual tools are executed by Core itself and are deliberately absent
+        // from the child process manifest. A mode that DECLARES one must still get it frozen
+        // in: dropping it here would leave the agent holding a declaration it can never see,
+        // which is how "the pack declares task_dispatch" would silently do nothing. Only
+        // DECLARED ones qualify — the mode's effective-tool union is the authority, exactly
+        // as for every provider tool.
+        var virtualEntries = (formalEffective ?? [])
+            .Where(CoreVirtualToolPolicy.IsCoreVirtual)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(VirtualEntry)
+            .ToArray();
+        foreach (var entry in virtualEntries)
+        {
+            byId[entry.Id] = entry;
+            available.Add(entry.Id);
+        }
 
         // Effective set to validate/freeze. When a formal mode governs the session, the agent ∩ mode
         // grant is authoritative and is trimmed to the tools the actual manifest offers — a
@@ -134,6 +196,9 @@ public sealed class ToolManifestSnapshotResolver : IToolManifestSnapshotResolver
         else if (formalEffective.Contains("*")) authorized = baseAuthorized;
         else if (formalEffective.Count == 0) authorized = [];
         else authorized = baseAuthorized.Where(item => formalEffective.Contains(item.Id, StringComparer.OrdinalIgnoreCase)).ToList();
+        // The declared virtual entries were never in baseAuthorized (they are not in the
+        // process manifest), so they are appended here rather than filtered into it.
+        authorized = [.. authorized, .. virtualEntries];
 
         var frozen = authorized.Select(ToFrozen).ToArray();
         return new ToolManifestSnapshot(manifest.ProtocolVersion, computedHash, frozen);
@@ -159,6 +224,21 @@ public sealed class ToolManifestSnapshotResolver : IToolManifestSnapshotResolver
                 throw new ToolManifestSnapshotException("TOOL_MANIFEST_INVALID", $"Tool '{tool.Id}' has incomplete execution policy metadata.");
         }
     }
+
+    /// <summary>
+    /// The one place that maps a declared Core-owned virtual tool id to its manifest entry. Adding
+    /// a virtual tool means adding a branch here and a manifest entry beside it - never a new
+    /// copy of this conditional at each call site.
+    /// </summary>
+    private static ToolManifestEntryDto VirtualEntry(string toolId) =>
+        CoreVirtualToolPolicy.IsCreateWorkspace(toolId) ? CoreWorkspaceTool.ManifestEntry()
+        : CoreVirtualToolPolicy.IsTaskDispatch(toolId) ? CoreTaskDispatchTool.ManifestEntry()
+        : CoreVirtualToolPolicy.IsTaskWait(toolId) ? CoreTaskWaitTool.ManifestEntry()
+        : CoreVirtualToolPolicy.IsPlanUpdate(toolId) ? CoreTaskPlanTool.ManifestEntry()
+        : CoreVirtualToolPolicy.IsReadAttachment(toolId) ? CoreAttachmentReadTool.ManifestEntry()
+        : TinaChatVirtualTools.ManifestEntry(toolId)
+        ?? OrganizationVirtualTools.ManifestEntry(toolId)
+        ?? throw new InvalidOperationException($"Core-owned virtual tool '{toolId}' has no manifest entry.");
 
     private static FrozenToolManifestEntry ToFrozen(ToolManifestEntryDto tool) => new(
         tool.Id.Trim(),

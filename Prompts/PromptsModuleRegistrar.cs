@@ -85,10 +85,20 @@ internal sealed class PromptAssembler : IPromptAssembler
                 ? $"agent-version:{agentVersionId}:{request.AgentVersionContentHash}"
                 : $"agent:{agentId}:system-prompt");
         }
+        // Workspace facts sit next to the run-level mode profile: the same text
+        // reaches every agent of the run, so a model always knows the absolute
+        // root its path arguments are validated against.
+        if (request.Workspace is { } workspace)
+        {
+            var (workspaceSection, workspaceWarnings) = WorkspaceContext(workspace, budget - used);
+            sections.Add(workspaceSection);
+            fragmentIds.Add("builtin:workspace-context");
+            used += EstimateTokens(workspaceSection);
+            warnings.AddRange(workspaceWarnings);
+        }
+
         var runtimeProfile = contextPack?.Metadata.TryGetValue("runtime_profile_id", out var profileId) == true ? profileId : "unspecified";
-        var applicationMode = contextPack?.Metadata.TryGetValue("application_mode", out var applicationModeId) == true ? applicationModeId : "conversation";
-        var agentMode = contextPack?.Metadata.TryGetValue("agent_mode", out var agentModeId) == true ? agentModeId : "auto";
-        var modeProfile = $"Mode profile: application_mode={applicationMode}; agent_mode={agentMode}; runtime_profile_id={runtimeProfile}.";
+        var modeProfile = $"Mode profile: runtime_profile_id={runtimeProfile}.";
         var modeTokens = EstimateTokens(modeProfile);
         if (modeTokens <= budget - used)
         {
@@ -114,6 +124,13 @@ internal sealed class PromptAssembler : IPromptAssembler
             warnings.Add("Agent profile could not fit in the configured context budget.");
         }
 
+        // The pipeline content comes WITH the request: the caller (the run's frozen
+        // roster) has already resolved WHICH pipeline version applies, so the assembler
+        // never re-resolves it per agent here. Source priority is decided at freeze time
+        // and is, in order: the mode version's prompt pipeline > the agent's
+        // base_prompt_pipeline_ref > the workspace default. A mode-level pipeline
+        // therefore reaches every agent of that mode — it describes how the mode
+        // collaborates, while per-agent role wording stays on request.SystemPrompt.
         if (request.PromptVersionId is { } promptVersionId)
         {
             fragmentIds.Add($"prompt-version:{promptVersionId}:{request.PromptVersionContentHash}");
@@ -207,6 +224,51 @@ internal sealed class PromptAssembler : IPromptAssembler
             FragmentIds = fragmentIds,
             Warnings = warnings
         };
+    }
+
+    /// <summary>
+    /// The run's workspace facts. Root, git facts and the path contract are always
+    /// present — a model that does not know its workspace cannot use any
+    /// path-taking tool, which is exactly the failure this section exists to
+    /// prevent. Only the optional top-level listing is budget-trimmed.
+    /// </summary>
+    internal static (string Text, IReadOnlyList<string> Warnings) WorkspaceContext(
+        FrozenWorkspaceBinding workspace,
+        int remainingBudget)
+    {
+        var warnings = new List<string>();
+        var lines = new List<string>
+        {
+            "Workspace: exactly one workspace is in scope for this run.",
+            $"- Root (absolute): {workspace.RootPath}",
+            workspace.IsGitRepository
+                ? workspace.GitBranch is { } branch
+                    ? $"- Git repository: yes (branch {branch})"
+                    : "- Git repository: yes (detached HEAD)"
+                : "- Git repository: no",
+            $"- Path contract ({workspace.PathContract}): every path argument must be an absolute path inside the root; a relative path resolves against the root. Nothing outside the root is readable or writable.",
+            "- Never ask the user for the workspace path; use the root above. When a tool reports a path outside the root, correct the path instead of guessing another location."
+        };
+        if (workspace.ReadOnlyRoots.Count > 0)
+        {
+            lines.Insert(3, $"- Additional read-only roots: {string.Join(", ", workspace.ReadOnlyRoots)}");
+        }
+
+        if (workspace.TopLevelEntries.Count > 0)
+        {
+            var suffix = workspace.TopLevelTruncated ? " [truncated]" : string.Empty;
+            var listing = $"- Top-level entries: {string.Join(", ", workspace.TopLevelEntries)}{suffix}";
+            if (EstimateTokens(string.Join('\n', lines.Append(listing))) <= remainingBudget)
+            {
+                lines.Add(listing);
+            }
+            else
+            {
+                warnings.Add("The workspace top-level listing was omitted because the context budget is exhausted.");
+            }
+        }
+
+        return (string.Join('\n', lines), warnings);
     }
 
     private async Task<string> ReadTextAsync(PromptFragmentVersionRecord version, CancellationToken cancellationToken)

@@ -105,6 +105,9 @@ public static class DevSeed
                 seededChatRoute);
         }
 
-        await BootstrapAgentDirectory.SeedIfEmptyAsync(services, ct).ConfigureAwait(false);
+        // No built-in roster is seeded: a workspace with no installed agent pack
+        // cannot talk. Deployments that pre-provision new workspaces configure an
+        // ordinary bootstrap pack (installed through the regular pack pipeline).
+        await BootstrapPack.InstallIfConfiguredAsync(services, ct).ConfigureAwait(false);
     }
 }

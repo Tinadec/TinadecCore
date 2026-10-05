@@ -47,9 +47,9 @@ public static class ServiceCollectionExtensions
                 ? new PostgresProjectVectorDatabase(connection)
                 : new ProjectVectorDatabase(connection, sp.GetRequiredService<StoragePaths>());
         });
-        services.TryAddSingleton<ISecretStore>(sp => OperatingSystem.IsWindows()
-            ? new ProtectedFileSecretStore(sp.GetRequiredService<StoragePaths>())
-            : new EnvironmentSecretStore());
+        services.TryAddSingleton<ISecretStore>(sp => SecretStoreFactory.Resolve(
+            sp.GetRequiredService<IOptions<TinadecPersistenceOptions>>().Value.SecretStore,
+            sp.GetRequiredService<StoragePaths>()));
         services.TryAddSingleton<INonceMaterialStore, NonceMaterialStore>();
         services.TryAddSingleton<IStorageMigrationRunner, StorageMigrationRunner>();
         return services;

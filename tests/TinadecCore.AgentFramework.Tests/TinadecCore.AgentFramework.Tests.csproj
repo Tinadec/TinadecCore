@@ -14,6 +14,7 @@
     <ProjectReference Include="..\..\LoopGuard\TinadecCore.LoopGuard.csproj" />
     <ProjectReference Include="..\..\Lifecycle\TinadecCore.Lifecycle.csproj" />
     <ProjectReference Include="..\..\Runtime\TinadecCore.Runtime.csproj" />
+    <ProjectReference Include="..\..\Tools\TinadecCore.Tools.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -23,11 +24,11 @@
     <PackageReference Include="coverlet.collector" />
     <PackageReference Include="Microsoft.Extensions.AI" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
-    <PackageReference Include="Tomlyn" />
   </ItemGroup>
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <None Include="..\..\DmaEA\Configuration\default-agent-runtime.toml" Link="DmaEA\Configuration\default-agent-runtime.toml" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

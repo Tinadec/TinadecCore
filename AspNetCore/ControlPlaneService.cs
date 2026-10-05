@@ -4,11 +4,12 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Data.Sqlite;
 using TinadecCore.Abstractions;
 using TinadecCore.Abstractions.Ports;
 using TinadecCore.Contracts.Dtos;
 using TinadecCore.DmaEA;
-using TinadecCore.DmaEA.CliRuntime;
+using TinadecCore.Models.Harness;
 using TinadecCore.Lifecycle;
 using TinadecCore.Models;
 using TinadecCore.Persistence;
@@ -16,6 +17,16 @@ using TinadecCore.Prompts;
 using TinadecCore.Tools;
 
 namespace TinadecCore.Runtime;
+
+public sealed record PreAuthorizationRequestDto(
+    Guid RunId,
+    string? LaneKey,
+    IReadOnlyList<string>? ToolScope,
+    string? ParameterConstraintHash,
+    string? RiskMax,
+    int MaxUses,
+    DateTimeOffset? ExpiresAt,
+    string? Summary);
 
 public sealed class ControlPlaneService
 {
@@ -31,15 +42,19 @@ public sealed class ControlPlaneService
     private readonly IAuthorizationService _authorization;
     private readonly ILifecycleManager _runs;
     private readonly IFullDuplexRunEngine _engine;
-    private readonly ICliProcessManager _cli;
+    private readonly IOpencodeServeProcessManager _opencode;
+    private readonly IAcpHarnessProber _acp;
+    private readonly IHarnessBinaryResolver _harnessBinaries;
+    private readonly IHarnessTerminalHost _terminalHost;
 
     public ControlPlaneService(IDbContextFactory<ModelControlDbContext> models, IDbContextFactory<PromptControlDbContext> prompts,
         IDbContextFactory<LifecycleDbContext> lifecycle,
         IContentStore content, ISecretStore secrets, ITenantContextAccessor tenant, IToolApprovalCoordinator approvals,
         IAuthorizationService authorization, IToolExecutionCoordinator executions,
-        ILifecycleManager runs, IFullDuplexRunEngine engine, ICliProcessManager cli,
-        IUserToolActionService userActions)
-    { _models = models; _prompts = prompts; _lifecycle = lifecycle; _content = content; _secrets = secrets; _tenant = tenant; _approvals = approvals; _authorization = authorization; _executions = executions; _userActions = userActions; _runs = runs; _engine = engine; _cli = cli; }
+        ILifecycleManager runs, IFullDuplexRunEngine engine, IOpencodeServeProcessManager opencode,
+        IAcpHarnessProber acp, IHarnessBinaryResolver harnessBinaries,
+        IUserToolActionService userActions, IHarnessTerminalHost terminalHost)
+    { _models = models; _prompts = prompts; _lifecycle = lifecycle; _content = content; _secrets = secrets; _tenant = tenant; _approvals = approvals; _authorization = authorization; _executions = executions; _userActions = userActions; _runs = runs; _engine = engine; _opencode = opencode; _acp = acp; _harnessBinaries = harnessBinaries; _terminalHost = terminalHost; }
 
     private TenantContext Tenant => _tenant.Current;
     private static async Task<(string text, ContentReference reference)> PutJsonAsync(IContentStore store, Guid tenant, Guid? workspace, string kind, object value, CancellationToken ct)
@@ -48,6 +63,53 @@ public sealed class ControlPlaneService
     { await using var stream = await store.OpenReadAsync(new ContentReference(reference, "", 0, "application/json"), ct); using var reader = new StreamReader(stream); return await reader.ReadToEndAsync(ct); }
     private static bool Matches(long revision, string? match) => string.IsNullOrWhiteSpace(match) || long.TryParse(match, out var value) && value == revision;
 
+    /// <summary>
+    /// Conditional-update gate for mutable control-plane rows (providers, routes).
+    /// A missing If-Match is a hard 428 (blind writes were the root cause of live
+    /// configuration being overwritten by verification scripts); a stale revision is 412.
+    /// </summary>
+    private static IResult? CheckPrecondition(long revision, string? ifMatch)
+    {
+        if (string.IsNullOrWhiteSpace(ifMatch)) return Results.Json(new { code = "precondition_required", message = "If-Match header with the current numeric revision is required for this operation." }, statusCode: 428);
+        var normalized = ifMatch.Trim().Trim('"');
+        if (!long.TryParse(normalized, out var value)) return Results.Json(new { code = "invalid_if_match", message = "If-Match must contain the numeric revision." }, statusCode: 400);
+        return value != revision ? Results.StatusCode(412) : null;
+    }
+
+    /// <summary>Routes whose saved versions still reference the provider, for the provider_in_use guard.</summary>
+    private static async Task<List<string>> ReferencingRoutePurposesAsync(ModelControlDbContext db, Guid providerId, CancellationToken ct)
+    {
+        var purposes = await (
+            from candidate in db.RouteCandidates.AsNoTracking()
+            join version in db.RouteVersions.AsNoTracking() on candidate.RouteVersionId equals version.Id
+            join route in db.Routes.AsNoTracking() on version.RouteId equals route.Id
+            where candidate.ProviderInstanceId == providerId && route.DeletedAt == null
+            select route.Purpose).Distinct().ToListAsync(ct);
+        return purposes;
+    }
+
+    private static IResult ProviderInUse(IEnumerable<string> purposes) => Results.Json(
+        new { code = "provider_in_use", message = $"Provider is still referenced by model route(s): {string.Join(", ", purposes)}. Rebind or delete the route(s) first, or retry with force=true.", routes = purposes.ToArray() },
+        statusCode: 409);
+
+    /// <summary>
+    /// Merges the incoming provider payload onto the persisted current-version config so a
+    /// partial update (e.g. only the model list) keeps unspecified fields such as protocol,
+    /// base_url, binary_path and launch_args. Request body wins; missing keys keep the old
+    /// value; an explicit JSON null clears the key. Secret fields never enter the blob.
+    /// </summary>
+    private static Dictionary<string, JsonElement> MergeProviderConfig(Dictionary<string, JsonElement> current, JsonElement input)
+    {
+        var merged = new Dictionary<string, JsonElement>(current);
+        foreach (var property in input.EnumerateObject())
+        {
+            if (property.Name is "api_key" or "clear_api_key") continue;
+            if (property.Value.ValueKind == JsonValueKind.Null) merged.Remove(property.Name);
+            else merged[property.Name] = property.Value.Clone();
+        }
+        return merged;
+    }
+
     public async Task<IResult> ListProviders(CancellationToken ct)
     { await using var db = await _models.CreateDbContextAsync(ct); var rows = await db.Providers.Where(x => x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId && x.DeletedAt == null).ToListAsync(ct); return Results.Ok(await Task.WhenAll(rows.Select(ToProvider))); }
     private async Task<object> ToProvider(ModelProviderRecord row)
@@ -55,7 +117,7 @@ public sealed class ControlPlaneService
         JsonElement Value(string key) => cfg != null && cfg.TryGetValue(key, out var v) ? v : default;
         string? String(string key) => Value(key).ValueKind == JsonValueKind.String ? Value(key).GetString() : null;
         string[] Models() => Value("models").ValueKind == JsonValueKind.Array ? Value("models").EnumerateArray().Select(x => x.GetString() ?? "").Where(x => x.Length > 0).ToArray() : Array.Empty<string>();
-        return new { id = row.Id, driver = row.Driver, protocol = ChatProtocols.Normalize(String("protocol") ?? ChatProtocols.InferFromDriver(row.Driver)), display_name = row.DisplayName, connection_kind = row.ConnectionKind, base_url = String("base_url"), model = String("model"), models = Models(), has_api_key = row.SecretReference != null && _secrets.ExistsAsync(row.SecretReference).GetAwaiter().GetResult(), binary_path = String("binary_path"), home_path = String("home_path"), server_url = String("server_url"), launch_args = String("launch_args"), capabilities = cfg != null && cfg.TryGetValue("capabilities", out var c) && c.ValueKind == JsonValueKind.Array ? c.EnumerateArray().Select(x => x.GetString() ?? "").ToArray() : Array.Empty<string>(), enabled = row.Enabled, status = row.Enabled ? "configured" : "disabled", status_message = "Persisted configuration", revision = row.Revision, scope = row.Scope, created_at = row.CreatedAt, updated_at = row.UpdatedAt }; }
+        return new { id = row.Id, driver = row.Driver, protocol = HarnessCatalog.ResolveProtocol(String("protocol"), row.Driver, String("channel")), channel = String("channel"), display_name = row.DisplayName, connection_kind = row.ConnectionKind, base_url = String("base_url"), model = String("model"), models = Models(), model_parameters = ModelParameters.ReadMap(Value("model_parameters")), has_api_key = row.SecretReference != null && _secrets.ExistsAsync(row.SecretReference).GetAwaiter().GetResult(), binary_path = String("binary_path"), home_path = String("home_path"), server_url = String("server_url"), launch_args = String("launch_args"), capabilities = cfg != null && cfg.TryGetValue("capabilities", out var c) && c.ValueKind == JsonValueKind.Array ? c.EnumerateArray().Select(x => x.GetString() ?? "").ToArray() : Array.Empty<string>(), enabled = row.Enabled, status = row.Enabled ? "configured" : "disabled", status_message = "Persisted configuration", revision = row.Revision, scope = row.Scope, created_at = row.CreatedAt, updated_at = row.UpdatedAt }; }
 
     public async Task<IResult> RefreshProviderModels(Guid id, CancellationToken ct)
     {
@@ -67,7 +129,7 @@ public sealed class ControlPlaneService
         if (version != null) cfg = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(await ReadAsync(_content, version.ContentReference, ct));
         var baseUrl = cfg != null && cfg.TryGetValue("base_url", out var b) && b.ValueKind == JsonValueKind.String ? b.GetString() : null;
         if (string.IsNullOrWhiteSpace(baseUrl)) return Results.BadRequest(new { code = "MODEL_DISCOVERY_INVALID", message = "Provider has no base_url configured; model discovery requires an HTTP model endpoint." });
-        var protocol = ChatProtocols.Normalize(cfg != null && cfg.TryGetValue("protocol", out var proto) && proto.ValueKind == JsonValueKind.String ? proto.GetString() : ChatProtocols.InferFromDriver(row.Driver));
+        var protocol = HarnessCatalog.ResolveProtocol(cfg != null && cfg.TryGetValue("protocol", out var proto) && proto.ValueKind == JsonValueKind.String ? proto.GetString() : null, row.Driver, null);
         string? apiKey = row.SecretReference != null && _secrets.ExistsAsync(row.SecretReference).GetAwaiter().GetResult() ? await _secrets.GetAsync(row.SecretReference, ct) : null;
         try
         {
@@ -96,53 +158,84 @@ public sealed class ControlPlaneService
         { return Results.Json(new { code = "MODEL_DISCOVERY_NETWORK", message = ex.Message }, statusCode: 502); }
     }
 
-    private sealed record KnownCli(string Driver, string DisplayName, string Executable, string? HomePath, string? ServerUrl, string? LaunchArgs);
-
-    // Well-known model CLIs the workbench can host. Discovery probes default install locations so
-    // users can connect a local CLI runtime without manually typing a path.
-    private static readonly KnownCli[] KnownClis =
-    [
-        new("claude-cli", "Claude Code", "claude", "~/.claude", null, null),
-        new("codex-cli", "Codex CLI", "codex", "~/.codex", null, null),
-        new("cursor-acp", "Cursor ACP", "cursor-agent", null, null, "--acp-port 0"),
-        new("opencode", "OpenCode", "opencode", null, "http://127.0.0.1:4096", "serve --port 4096")
-    ];
-
-    public async Task<IResult> DiscoverCliRuntimes(CancellationToken ct, IEnumerable<string>? searchPaths = null)
+    /// <summary>
+    /// Reads the harness catalog instead of a hand-written driver list, so what the model center can
+    /// offer is exactly what Core has verified: one row per harness, each carrying the channels that
+    /// harness actually has and whether this build can drive them. The old four-row table named
+    /// drivers after channels (<c>claude-cli</c>, <c>cursor-acp</c>) and reported a version probe as
+    /// proof that an ACP session would work, which is how a harness that could never connect ended up
+    /// offered as connectable.
+    /// </summary>
+    public async Task<IResult> DiscoverHarnesses(CancellationToken ct, IEnumerable<string>? searchPaths = null)
     {
         await using var db = await _models.CreateDbContextAsync(ct);
-        var configured = (await db.Providers
+        var configuredRows = await db.Providers
             .Where(x => x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId && x.DeletedAt == null)
-            .Select(x => x.Driver).ToListAsync(ct)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            .Select(x => new { x.Driver, x.CurrentVersionId }).ToListAsync(ct);
 
-        var resolved = searchPaths ?? (IEnumerable<string>?)null;
-        var candidates = KnownClis.Select(cli =>
+        var candidates = new List<object>();
+        foreach (var spec in HarnessCatalog.All)
         {
-            var existing = configured.Contains(cli.Driver);
-            var path = existing ? null : ResolveCliExecutable(cli.Executable, resolved);
-            var verified = path != null && VerifyCliExecutable(path);
-            return new
+            var rows = configuredRows
+                .Where(row => string.Equals(row.Driver, spec.Id, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            var configuredChannels = new List<string>();
+            string? configuredBinaryPath = null;
+            foreach (var row in rows)
             {
-                driver = cli.Driver,
-                display_name = cli.DisplayName,
-                binary_path = verified ? path : null,
-                home_path = existing || verified ? cli.HomePath : null,
-                server_url = existing || verified ? cli.ServerUrl : null,
-                launch_args = existing || verified ? cli.LaunchArgs : null,
-                status = existing ? "configured" : verified ? "found" : "missing"
-            };
-        }).ToList();
+                var cfg = await LoadProviderConfigAsync(db, row.CurrentVersionId, ct);
+                string? ConfigText(string key) => cfg.TryGetValue(key, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+                var channel = AgentChannels.Normalize(ConfigText("channel"));
+                var protocol = HarnessCatalog.ResolveProtocol(ConfigText("protocol"), spec.Id, ConfigText("channel"));
+                configuredChannels.Add(channel ?? protocol);
+                configuredBinaryPath ??= ConfigText("binary_path");
+            }
+            var existing = rows.Count > 0;
+            var located = _harnessBinaries.Resolve(spec.Id, searchPaths);
+            var probe = located is null ? null : await VerifyCliExecutable(located.BinaryName, located.BinaryPath, spec.VersionProbe, ct);
+            var reachable = existing || probe?.Runnable == true;
+            // The serve argv is a template with a {port} placeholder; discovery reports the concrete
+            // form it would start with, and the connect path re-materializes it from the endpoint that
+            // actually answered, so a second server on the same machine does not collide.
+            var serveArgv = spec.HttpServer is { } server
+                ? string.Join(' ', server.Argv).Replace("{port}", server.DefaultPort.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                : null;
+            candidates.Add(new
+            {
+                driver = spec.Id,
+                display_name = spec.DisplayName,
+                vendor = spec.Vendor,
+                docs_url = spec.DocsUrl,
+                binary_path = reachable ? located?.BinaryPath ?? configuredBinaryPath : null,
+                // Reported as a fact about the harness, not as the process HOME. The two are different
+                // directories: Kimi's config home is `~/.kimi-code`, and handing that to the child as
+                // HOME would make it look for `~/.kimi-code/.kimi-code`. Only the path the operator
+                // types in the form becomes HOME, and discovery never invents one.
+                config_home = reachable ? _harnessBinaries.ConfigHomeOf(spec.Id) : null,
+                server_url = reachable && spec.HttpServer is { } endpoint ? $"http://127.0.0.1:{endpoint.DefaultPort}" : null,
+                launch_args = reachable ? serveArgv : null,
+                status = existing ? "configured" : probe?.Runnable == true ? "found" : "missing",
+                configured_channels = configuredChannels.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+                // A probe that did not answer is not evidence that the harness is absent, and the old
+                // code turned that difference invisible: an unread stdout pipe or a loaded machine made
+                // an installed binary read as "not detected". The note says which is which.
+                probe_note = existing ? null : probe is { Runnable: false } failed ? failed.Note : null,
+                channels = HarnessChannelFacts(spec).ToArray(),
+                caveats = spec.KnownCaveats.ToArray()
+            });
+        }
         return Results.Ok(new { cli_runtimes = candidates });
     }
 
     /// <summary>
-    /// Starts (or reuses) a discovered CLI runtime and persists it as an enabled provider.
-    /// ACP CLIs are spawned with a free <c>--acp-port</c>; opencode is spawned with
-    /// <c>serve --port</c>. The saved provider carries the reachable <c>server_url</c> and
-    /// effective launch args so later runs can respawn it after a restart. Routes are not
-    /// touched — binding the provider to the chat route stays a manual model-center action.
+    /// Starts (or reuses) a discovered harness runtime and persists it as an enabled provider.
+    /// opencode's HTTP server shape is spawned with <c>serve --port</c> and stored with the
+    /// reachable <c>server_url</c>, so later runs can respawn it after a restart. ACP is a stdio
+    /// session and has no port to inject: an ACP connect stores the harness's own argv and proves
+    /// readiness by handshake, not by polling a URL. Routes are not touched — binding the provider
+    /// to the chat route stays a manual model-center action.
     /// </summary>
-    public async Task<IResult> ConnectCliRuntime(JsonElement input, CancellationToken ct)
+    public async Task<IResult> ConnectHarness(JsonElement input, CancellationToken ct)
     {
         string? Get(string key) => input.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
         var driver = Get("driver");
@@ -150,126 +243,357 @@ public sealed class ControlPlaneService
         if (string.IsNullOrWhiteSpace(driver)) return Results.BadRequest(new { code = "CLI_CONNECT_INVALID", message = "driver is required." });
         if (string.IsNullOrWhiteSpace(binaryPath)) return Results.BadRequest(new { code = "CLI_CONNECT_INVALID", message = "binary_path is required." });
         if (!File.Exists(binaryPath)) return Results.BadRequest(new { code = "CLI_CONNECT_INVALID", message = $"binary_path does not exist: {binaryPath}" });
-        var protocol = ChatProtocols.Normalize(Get("protocol") ?? ChatProtocols.InferFromDriver(driver));
-        if (protocol is not (ChatProtocols.Acp or ChatProtocols.OpencodeServe)) return Results.BadRequest(new { code = "CLI_CONNECT_INVALID", message = $"driver '{driver}' is not a CLI runtime (protocol {protocol})." });
-
-        CliRuntimeEndpoint endpoint;
-        try
+        var channel = Get("channel");
+        // A named channel is a routing decision, so it is validated against the harness rather than
+        // resolved away: `claude-code` + `acp` must be refused by name, not silently read as the
+        // driver's default protocol and then fail as an OpenAI provider with no base_url.
+        var spec = HarnessCatalog.Find(driver);
+        if (spec is not null && !string.IsNullOrWhiteSpace(channel) && spec.Channel(channel) is null)
         {
-            endpoint = await _cli.EnsureRunningAsync(new CliRuntimeConfig(driver, binaryPath, Get("launch_args"), Get("server_url"), Get("home_path")), ct);
+            var declared = string.Join(", ", spec.Channels.Select(declaredChannel => declaredChannel.Channel));
+            return Results.BadRequest(new { code = "harness_channel_unsupported", message = $"'{driver}' has no '{channel}' channel; the catalog declares {declared}." });
         }
-        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or IOException)
+        var protocol = HarnessCatalog.ResolveProtocol(Get("protocol"), driver, channel);
+        if (spec is not null && Get("protocol") is null && string.IsNullOrWhiteSpace(channel))
         {
-            return Results.Json(new { code = "CLI_CONNECT_FAILED", message = ex.Message }, statusCode: 502);
+            // Neither axis named: silently taking the catalog's default protocol is how a connect for a
+            // harness with three ways to be reached picks one on the caller's behalf.
+            return Results.BadRequest(new { code = "harness_channel_required", message = $"'{driver}' can be reached multiple ways; send 'channel' ({string.Join(", ", spec.Channels.Select(declaredChannel => declaredChannel.Channel))}) or an explicit 'protocol'." });
+        }
+        if (spec is not null && !OffersProtocol(spec, protocol))
+        {
+            return Results.BadRequest(new { code = "harness_protocol_unsupported", message = $"'{driver}' does not speak '{protocol}'; this harness offers {string.Join(", ", OfferedProtocols(spec))}." });
+        }
+        if (protocol == ChatProtocols.HeadlessCli && !HarnessCatalog.HasVerifiedHeadlessEnvelope(driver))
+        {
+            return Results.BadRequest(new
+            {
+                code = "CLI_CONNECT_INVALID",
+                message = $"'{driver}' has no headless answer frame captured by this build; choose another declared channel."
+            });
         }
 
-        await using var db = await _models.CreateDbContextAsync(ct);
-        var existing = await db.Providers.SingleOrDefaultAsync(x => x.Driver == driver && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId && x.DeletedAt == null, ct);
-        var port = new Uri(endpoint.ServerUrl).Port;
+        if (protocol == ChatProtocols.Tui && !_terminalHost.IsSupported)
+        {
+            return Results.BadRequest(new
+            {
+                code = "CLI_CONNECT_INVALID",
+                message = $"'{driver}' on the TUI channel cannot be connected because this platform has no supported terminal host."
+            });
+        }
+
+        if (protocol is not (ChatProtocols.Acp or ChatProtocols.OpencodeServe or ChatProtocols.HeadlessCli or ChatProtocols.Tui))
+        {
+            return Results.BadRequest(new
+            {
+                code = "CLI_CONNECT_INVALID",
+                message = $"'{driver}' does not resolve to a channel this build can connect (protocol '{protocol}'); connectable protocols are '{ChatProtocols.Acp}', '{ChatProtocols.HeadlessCli}', '{ChatProtocols.Tui}' and '{ChatProtocols.OpencodeServe}'."
+            });
+        }
+
+        OpencodeServeEndpoint? endpoint = null;
+        var existing = await ExistingCliProviderAsync(driver, channel, protocol, ct);
+        if (protocol == ChatProtocols.Acp)
+        {
+            // A stdio session has no port to poll, so readiness is a real handshake: spawn,
+            // initialize, open a session, then tear the harness down again. Storing a server_url the
+            // probe never proved is what let a provider look connected while it could not start.
+            try
+            {
+                await ProbeAcpHandshakeAsync(driver, binaryPath, Get("home_path"), existing?.Id, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Everything a harness can fail with here is a fact about connecting to it: an
+                // unavailable binary, a timeout waiting for `initialize`, a session the agent
+                // refused. Only the caller's cancellation is a different kind of answer.
+                return Results.Json(new { code = "CLI_CONNECT_FAILED", message = ex.Message }, statusCode: 502);
+            }
+        }
+        else if (protocol == ChatProtocols.OpencodeServe)
+        {
+            try
+            {
+                endpoint = await _opencode.EnsureRunningAsync(new OpencodeServeConfig(binaryPath, Get("launch_args"), Get("server_url"), Get("home_path")), ct);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or IOException)
+            {
+                return Results.Json(new { code = "CLI_CONNECT_FAILED", message = ex.Message }, statusCode: 502);
+            }
+        }
+
+        var port = endpoint is null ? 0 : new Uri(endpoint.ServerUrl).Port;
         var payload = JsonSerializer.SerializeToElement(new
         {
             driver,
             display_name = Get("display_name") ?? driver,
             connection_kind = "cli",
             protocol,
+            channel,
             binary_path = binaryPath,
             home_path = Get("home_path"),
-            server_url = endpoint.ServerUrl,
-            launch_args = Get("launch_args") ?? (protocol == ChatProtocols.OpencodeServe ? $"serve --port {port}" : $"--acp-port {port}"),
+            server_url = endpoint?.ServerUrl,
+            launch_args = Get("launch_args") ?? (protocol == ChatProtocols.OpencodeServe ? $"serve --port {port}" : null),
             enabled = true
         });
-        return await SaveProvider(payload, existing?.Id, null, ct);
+        // Internal system path: the CLI process just spawned is the source of truth, so the
+        // save carries the row's live revision to satisfy the mandatory If-Match gate.
+        return await SaveProvider(payload, existing?.Id, existing?.Revision.ToString(System.Globalization.CultureInfo.InvariantCulture), ct);
     }
 
-    private static string? ResolveCliExecutable(string name, IEnumerable<string>? searchPaths)
+    /// <summary>
+    /// Proves the harness can complete an ACP handshake. Everything about how it is spawned — the
+    /// catalog's argv, the governed scratch directory it is allowed to work in — stays behind the
+    /// prober port, because this file's job is the provider row, not the process shape.
+    /// </summary>
+    private async Task ProbeAcpHandshakeAsync(string driver, string binaryPath, string? homePath, Guid? providerInstanceId, CancellationToken ct) =>
+        await _acp.ProbeAsync(providerInstanceId, driver, binaryPath, homePath, ct);
+
+    private async Task<ModelProviderRecord?> ExistingCliProviderAsync(string driver, string? channel, string protocol, CancellationToken ct)
     {
-        var paths = searchPaths ?? DefaultSearchPaths();
-        foreach (var directory in paths)
+        await using var db = await _models.CreateDbContextAsync(ct);
+        var rows = await db.Providers
+            .Where(x => x.Driver == driver && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId && x.DeletedAt == null)
+            .ToListAsync(ct);
+        foreach (var row in rows)
         {
-            if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory)) continue;
-            var candidate = Path.Combine(directory, name);
-            if (File.Exists(candidate)) return candidate;
-            if (OperatingSystem.IsWindows())
-            {
-                foreach (var extension in new[] { ".exe", ".cmd", ".bat" })
-                {
-                    var withExtension = candidate + extension;
-                    if (File.Exists(withExtension)) return withExtension;
-                }
-            }
+            var cfg = await LoadProviderConfigAsync(db, row.CurrentVersionId, ct);
+            string? ConfigText(string key) => cfg.TryGetValue(key, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+            var savedChannel = AgentChannels.Normalize(ConfigText("channel"));
+            if (channel is not null && string.Equals(savedChannel, AgentChannels.Normalize(channel), StringComparison.Ordinal)) return row;
+            if (channel is null && savedChannel is null && string.Equals(
+                HarnessCatalog.ResolveProtocol(ConfigText("protocol"), driver, null), protocol, StringComparison.OrdinalIgnoreCase)) return row;
         }
         return null;
     }
 
     /// <summary>
-    /// Probes that the discovered binary actually runs: <c>--version</c> must exit 0 within
-    /// 3 seconds. <c>.cmd</c>/<c>.bat</c> npm shims are launched through cmd.exe.
+    /// Asks a discovered binary for its version. The argv, the ceiling, and whether a non-zero exit
+    /// still counts as an answer all come from the harness's own probe record, because they are vendor
+    /// facts rather than local preferences: CodeBuddy prints a telemetry consent prompt and exits
+    /// non-zero when nothing answers it, so a strict <c>ExitCode == 0</c> rule reports an installed
+    /// binary as missing. <c>NeverUse</c> exists for the mirror-image hazard — a flag that looks
+    /// harmless but shells out to something with side effects.
     /// </summary>
-    private static bool VerifyCliExecutable(string path)
+    /// <remarks>
+    /// Both pipes are drained while the child runs. A binary printing more than the pipe buffer blocks
+    /// on its own write, and a parent waiting on a blocked child looks exactly like a binary that is
+    /// not installed — which is how a working harness silently disappeared from the model center.
+    /// </remarks>
+    private static async Task<CliProbe> VerifyCliExecutable(string name, string path, HarnessVersionProbe probe, CancellationToken ct)
     {
+        var process = new Process { StartInfo = BuildVersionProbeStart(path, probe) };
         try
         {
-            var fileName = path;
-            var arguments = "--version";
-            if (path.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".bat", StringComparison.OrdinalIgnoreCase))
+            if (!process.Start()) return new(false, $"starting '{path}' {string.Join(' ', probe.Argv)} returned false.");
+            var stdout = process.StandardOutput.ReadToEndAsync();
+            var stderr = process.StandardError.ReadToEndAsync();
+            using var deadline = new CancellationTokenSource();
+            deadline.CancelAfter(probe.TimeoutMs);
+            try
             {
-                fileName = "cmd.exe";
-                arguments = $"/c \"{path}\" --version";
+                await process.WaitForExitAsync(deadline.Token).ConfigureAwait(false);
+                await Task.WhenAll(stdout, stderr).ConfigureAwait(false);
             }
-            using var process = new Process
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                StartInfo = new ProcessStartInfo(fileName, arguments)
-                {
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                }
-            };
-            if (!process.Start()) return false;
-            if (!process.WaitForExit(3000))
-            {
-                process.Kill(entireProcessTree: true);
-                return false;
+                // The caller stopped looking; that is not a fact about the harness.
+                throw;
             }
-            return process.ExitCode == 0;
+            catch (OperationCanceledException)
+            {
+                TryKillProbeTree(process);
+                return new(false, $"'{name}' did not answer '{string.Join(' ', probe.Argv)}' within {probe.TimeoutMs} ms, so this build does not know whether it is installed.");
+            }
+            return process.ExitCode == 0 || probe.TolerateNonZeroExit
+                ? new(true, null)
+                : new(false, $"'{name}' exited {process.ExitCode} for '{string.Join(' ', probe.Argv)}'.");
         }
         catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or IOException)
         {
-            return false;
+            return new(false, $"'{name}' could not be probed: {ex.Message}");
+        }
+        finally
+        {
+            process.Dispose();
         }
     }
 
-    private static IEnumerable<string> DefaultSearchPaths()
+    private static void TryKillProbeTree(Process process)
     {
-        var paths = new List<string>();
-        var path = Environment.GetEnvironmentVariable("PATH");
-        if (!string.IsNullOrWhiteSpace(path)) paths.AddRange(path.Split(Path.PathSeparator));
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (!string.IsNullOrWhiteSpace(home))
+        try
         {
-            paths.Add(Path.Combine(home, ".local", "bin"));
-            paths.Add(Path.Combine(home, ".npm-global", "bin"));
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
         }
-        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        if (!string.IsNullOrWhiteSpace(appData)) paths.Add(Path.Combine(appData, "npm"));
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        if (!string.IsNullOrWhiteSpace(localAppData))
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
         {
-            paths.Add(localAppData);
-            paths.Add(Path.Combine(localAppData, "Programs"));
-            paths.Add(Path.Combine(localAppData, "Microsoft", "WinGet", "Links"));
+            // The probe is already leaving; a process that cannot be reported on is not worth a fault.
         }
-        return paths.Distinct().ToList();
     }
 
-    public async Task<IResult> SaveProvider(JsonElement input, Guid? id, string? ifMatch, CancellationToken ct)
-    { var now = DateTimeOffset.UtcNow; await using var db = await _models.CreateDbContextAsync(ct); var row = id.HasValue ? await db.Providers.SingleOrDefaultAsync(x => x.Id == id && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId && x.DeletedAt == null, ct) : null; if (row != null && !Matches(row.Revision, ifMatch)) return Results.StatusCode(412); if (row?.Id is null) { row = new ModelProviderRecord { Id = id ?? Guid.NewGuid(), TenantId = Tenant.TenantId, WorkspaceId = Tenant.WorkspaceId, CreatedByPrincipalId = Tenant.PrincipalId, CreatedAt = now, Revision = 0 }; db.Providers.Add(row); }
-        row.Driver = input.TryGetProperty("driver", out var p) ? p.GetString() ?? "" : row.Driver; row.DisplayName = input.TryGetProperty("display_name", out p) ? p.GetString() ?? row.Driver : row.DisplayName; row.ConnectionKind = input.TryGetProperty("connection_kind", out p) ? p.GetString() ?? "api-key" : row.ConnectionKind; row.Scope = input.TryGetProperty("scope", out p) ? p.GetString() ?? "workspace" : row.Scope; row.Enabled = !input.TryGetProperty("enabled", out p) || p.ValueKind != JsonValueKind.False; row.UpdatedByPrincipalId = Tenant.PrincipalId; row.UpdatedAt = now;
-        if (input.TryGetProperty("api_key", out p) && p.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(p.GetString())) { row.SecretReference ??= "provider-" + row.Id.ToString("N"); await _secrets.PutAsync(row.SecretReference, p.GetString()!, ct); } else if (input.TryGetProperty("clear_api_key", out p) && p.ValueKind == JsonValueKind.True && row.SecretReference != null) { await _secrets.DeleteAsync(row.SecretReference, ct); row.SecretReference = null; }
-        var cfg = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(input.GetRawText()) ?? new(); var stored = await PutJsonAsync(_content, Tenant.TenantId, Tenant.WorkspaceId, "model-config", cfg, ct); var version = new ModelProviderVersionRecord { Id = Guid.NewGuid(), ProviderId = row.Id, Version = (int)row.Revision + 1, ContentReference = stored.reference.Value, ContentHash = stored.reference.Sha256, ContentLength = stored.reference.Length, CreatedByPrincipalId = Tenant.PrincipalId, CreatedAt = now }; row.Revision++; row.CurrentVersionId = version.Id; db.ProviderVersions.Add(version); await db.SaveChangesAsync(ct); return Results.Ok(await ToProvider(row)); }
-    public async Task<IResult> DeleteProvider(Guid id, string? ifMatch, CancellationToken ct)
-    { await using var db = await _models.CreateDbContextAsync(ct); var row = await db.Providers.SingleOrDefaultAsync(x => x.Id == id && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId && x.DeletedAt == null, ct); if (row == null) return Results.NotFound(); if (!Matches(row.Revision, ifMatch)) return Results.StatusCode(412); row.DeletedAt = DateTimeOffset.UtcNow; row.UpdatedAt = DateTimeOffset.UtcNow; await db.SaveChangesAsync(ct); return Results.NoContent(); }
+    private static ProcessStartInfo BuildVersionProbeStart(string path, HarnessVersionProbe probe)
+    {
+        var psi = new ProcessStartInfo
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        if (OperatingSystem.IsWindows()
+            && (path.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".bat", StringComparison.OrdinalIgnoreCase)))
+        {
+            psi.FileName = "cmd.exe";
+            psi.ArgumentList.Add("/c");
+            psi.ArgumentList.Add(path);
+        }
+        else
+        {
+            psi.FileName = path;
+        }
+        foreach (var argument in probe.Argv) psi.ArgumentList.Add(argument);
+        return psi;
+    }
+
+    private sealed record CliProbe(bool Runnable, string? Note);
+
+    /// <summary>
+    /// Every channel of one harness that Core knows about, in the order the catalog declares them, with
+    /// the local-server shape stated as a channel-less entry because <c>opencode serve</c> is reached
+    /// over HTTP and not over a process channel.
+    /// </summary>
+    private List<object> HarnessChannelFacts(HarnessSpec spec)
+    {
+        var channels = new List<object>();
+        if (spec.HttpServer is { } server)
+            channels.Add(ChannelFact(null, server.Protocol, spec.Id));
+        foreach (var channel in spec.Channels)
+            channels.Add(ChannelFact(channel.Channel, channel.Protocol, spec.Id));
+        return channels;
+
+        /// <summary>
+        /// Drivability of the one-shot channel is a (harness, channel) fact: the headless client exists,
+        /// but it only parses answer frames this build has actually captured from that vendor. Offering
+        /// <c>cli</c> for a harness whose stdout has only ever been seen failing would light a button
+        /// whose run ends in "the harness never answered".
+        /// </summary>
+        ChannelFact ChannelFact(string? channel, string protocol, string harnessId)
+        {
+            var drivable = ChatProtocols.IsDrivable(protocol)
+                && (ChatProtocols.Normalize(protocol) != ChatProtocols.Tui || _terminalHost.IsSupported)
+                && (ChatProtocols.Normalize(protocol) != ChatProtocols.HeadlessCli
+                    || HarnessCatalog.HasVerifiedHeadlessEnvelope(harnessId));
+            return new ChannelFact(
+                channel,
+                protocol,
+                drivable,
+                drivable ? null : ChatProtocols.HarnessClientGap(protocol)
+                    ?? (ChatProtocols.Normalize(protocol) == ChatProtocols.HeadlessCli
+                        ? $"'{harnessId}' has no headless answer frame captured by this build"
+                        : null));
+        }
+    }
+
+    private sealed record ChannelFact(string? Channel, string Protocol, bool Drivable, string? Reason);
+
+    /// <summary>
+    /// The protocols one harness actually offers: its declared channels plus, for the harnesses that
+    /// also expose a long-lived local server, that server's protocol. Anything outside this set is a
+    /// dialect this product never implements for this binary, so it must be refused by name rather
+    /// than stored and discovered as a failing run.
+    /// </summary>
+    private static IEnumerable<string> OfferedProtocols(HarnessSpec spec) =>
+        spec.Channels.Select(channel => channel.Protocol)
+            .Concat(spec.HttpServer is { } server ? new[] { server.Protocol } : [])
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private static bool OffersProtocol(HarnessSpec spec, string protocol) =>
+        OfferedProtocols(spec).Contains(protocol, StringComparer.OrdinalIgnoreCase);
+
+    private static void RemoveSecret(Dictionary<string, JsonElement> cfg)
+    { cfg.Remove("api_key"); cfg.Remove("clear_api_key"); }
+
+    public async Task<IResult> SaveProvider(JsonElement input, Guid? id, string? ifMatch, CancellationToken ct, bool force = false)
+    {
+        var now = DateTimeOffset.UtcNow;
+        await using var db = await _models.CreateDbContextAsync(ct);
+        var row = id.HasValue ? await db.Providers.SingleOrDefaultAsync(x => x.Id == id && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId && x.DeletedAt == null, ct) : null;
+        if (row != null)
+        {
+            var precondition = CheckPrecondition(row.Revision, ifMatch);
+            if (precondition != null) return precondition;
+            var disabling = input.TryGetProperty("enabled", out var e) && e.ValueKind == JsonValueKind.False && row.Enabled;
+            if (disabling && !force)
+            {
+                var disablePurposes = await ReferencingRoutePurposesAsync(db, row.Id, ct);
+                if (disablePurposes.Count > 0) return ProviderInUse(disablePurposes);
+            }
+        }
+        var merged = row is null
+            ? MergeProviderConfig(new Dictionary<string, JsonElement>(), input)
+            : MergeProviderConfig(await LoadProviderConfigAsync(db, row.CurrentVersionId, ct), input);
+        try
+        {
+            if (merged.TryGetValue("model_parameters", out var parameters))
+            {
+                var settings = ModelParameters.ReadMap(parameters);
+                string? ConfigText(string key) => merged.TryGetValue(key, out var text) && text.ValueKind == JsonValueKind.String ? text.GetString() : null;
+                var protocol = HarnessCatalog.ResolveProtocol(ConfigText("protocol"), ConfigText("driver") ?? row?.Driver, ConfigText("channel"));
+                foreach (var item in settings.Values.Where(x => !x.IsEmpty))
+                {
+                    if (ChatProtocols.IsModelChosenByHarness(protocol)) throw new ArgumentException("Inference settings are managed by this harness.");
+                    if (item.ReasoningEffort is not null && !ModelParameters.SupportsReasoning(protocol))
+                        throw new ArgumentException("reasoning_effort is supported for OpenAI Chat and Responses protocols.");
+                    if (protocol == ChatProtocols.AnthropicMessages && item.Temperature is > 1)
+                        throw new ArgumentException("Anthropic temperature must be between 0 and 1.");
+                }
+            }
+        }
+        catch (Exception ex) when (ex is ArgumentException or JsonException)
+        {
+            return Results.BadRequest(new { code = "invalid_model_parameters", message = ex.Message });
+        }
+        var isNew = row is null;
+        if (isNew) row = new ModelProviderRecord { Id = id ?? Guid.NewGuid(), TenantId = Tenant.TenantId, WorkspaceId = Tenant.WorkspaceId, CreatedByPrincipalId = Tenant.PrincipalId, CreatedAt = now, Revision = 0 };
+        var provider = row!;
+        if (isNew) db.Providers.Add(provider);
+        provider.Driver = input.TryGetProperty("driver", out var p) ? p.GetString() ?? "" : provider.Driver; provider.DisplayName = input.TryGetProperty("display_name", out p) ? p.GetString() ?? provider.Driver : provider.DisplayName; provider.ConnectionKind = input.TryGetProperty("connection_kind", out p) ? p.GetString() ?? "api-key" : provider.ConnectionKind; provider.Scope = input.TryGetProperty("scope", out p) ? p.GetString() ?? "workspace" : provider.Scope; provider.Enabled = !input.TryGetProperty("enabled", out p) || p.ValueKind != JsonValueKind.False; provider.UpdatedByPrincipalId = Tenant.PrincipalId; provider.UpdatedAt = now;
+        if (input.TryGetProperty("api_key", out p) && p.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(p.GetString())) { provider.SecretReference ??= "provider-" + provider.Id.ToString("N"); await _secrets.PutAsync(provider.SecretReference, p.GetString()!, ct); } else if (input.TryGetProperty("clear_api_key", out p) && p.ValueKind == JsonValueKind.True && provider.SecretReference != null) { await _secrets.DeleteAsync(provider.SecretReference, ct); provider.SecretReference = null; }
+        RemoveSecret(merged);
+        var stored = await PutJsonAsync(_content, Tenant.TenantId, Tenant.WorkspaceId, "model-config", merged, ct);
+        // Version numbers must come from the existing version rows, not from the
+        // row revision: seeded/imported providers can hold Revision=0 alongside
+        // an existing version 1, so Revision+1 collided with the unique
+        // (provider_id, version) index on the first edit. SaveRoute already
+        // derives max(version)+1; providers must do the same.
+        var maxVersion = await db.ProviderVersions.Where(v => v.ProviderId == provider.Id).MaxAsync(v => (int?)v.Version, ct) ?? 0;
+        var version = new ModelProviderVersionRecord { Id = Guid.NewGuid(), ProviderId = provider.Id, Version = maxVersion + 1, ContentReference = stored.reference.Value, ContentHash = stored.reference.Sha256, ContentLength = stored.reference.Length, CreatedByPrincipalId = Tenant.PrincipalId, CreatedAt = now };
+        provider.Revision++; provider.CurrentVersionId = version.Id; db.ProviderVersions.Add(version); await db.SaveChangesAsync(ct);
+        return Results.Ok(await ToProvider(provider));
+    }
+
+    private async Task<Dictionary<string, JsonElement>> LoadProviderConfigAsync(ModelControlDbContext db, Guid versionId, CancellationToken ct)
+    {
+        var version = await db.ProviderVersions.AsNoTracking().SingleOrDefaultAsync(x => x.Id == versionId, ct);
+        if (version == null) return new Dictionary<string, JsonElement>();
+        return JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(await ReadAsync(_content, version.ContentReference, ct)) ?? new Dictionary<string, JsonElement>();
+    }
+
+    public async Task<IResult> DeleteProvider(Guid id, string? ifMatch, CancellationToken ct, bool force = false)
+    {
+        await using var db = await _models.CreateDbContextAsync(ct);
+        var row = await db.Providers.SingleOrDefaultAsync(x => x.Id == id && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId && x.DeletedAt == null, ct);
+        if (row == null) return Results.NotFound();
+        var precondition = CheckPrecondition(row.Revision, ifMatch);
+        if (precondition != null) return precondition;
+        if (!force)
+        {
+            var purposes = await ReferencingRoutePurposesAsync(db, row.Id, ct);
+            if (purposes.Count > 0) return ProviderInUse(purposes);
+        }
+        row.DeletedAt = DateTimeOffset.UtcNow; row.UpdatedAt = DateTimeOffset.UtcNow; await db.SaveChangesAsync(ct); return Results.NoContent();
+    }
     public async Task<IResult> ListRoutes(CancellationToken ct)
     {
         await using var db = await _models.CreateDbContextAsync(ct);
@@ -304,7 +628,11 @@ public sealed class ControlPlaneService
 
         var row = await db.Routes.SingleOrDefaultAsync(x => x.Purpose == purpose && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId && x.DeletedAt == null, ct);
         var now = DateTimeOffset.UtcNow;
-        if (row != null && !Matches(row.Revision, ifMatch)) return Results.StatusCode(412);
+        if (row != null)
+        {
+            var precondition = CheckPrecondition(row.Revision, ifMatch);
+            if (precondition != null) return precondition;
+        }
         if (row == null)
         {
             row = new ModelRouteRecord { Id = Guid.NewGuid(), TenantId = Tenant.TenantId, WorkspaceId = Tenant.WorkspaceId, Purpose = purpose, Scope = "workspace", CreatedByPrincipalId = Tenant.PrincipalId, CreatedAt = now };
@@ -340,8 +668,9 @@ public sealed class ControlPlaneService
         var version = await db.ProviderVersions.AsNoTracking().SingleOrDefaultAsync(x => x.Id == provider.CurrentVersionId, ct);
         if (version is null) return false;
         var config = JsonSerializer.Deserialize<JsonElement>(await ReadAsync(_content, version.ContentReference, ct));
-        var protocol = config.TryGetProperty("protocol", out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : ChatProtocols.InferFromDriver(provider.Driver);
-        return ChatProtocols.Normalize(protocol) is ChatProtocols.Acp or ChatProtocols.OpencodeServe;
+        string? Text(string key) => config.TryGetProperty(key, out var property) && property.ValueKind == JsonValueKind.String ? property.GetString() : null;
+        return ChatProtocols.IsModelChosenByHarness(
+            HarnessCatalog.ResolveProtocol(Text("protocol"), provider.Driver, Text("channel")));
     }
 
     public async Task<IResult> ListPrompts(CancellationToken ct)
@@ -364,6 +693,22 @@ public sealed class ControlPlaneService
             if (!Guid.TryParse(runId, out var parsedRun)) return Results.BadRequest(new { message = "run_id must be a valid Guid." });
             run = parsedRun;
         }
+        // This is a read-only projection across two contexts. Retry the whole read with
+        // fresh contexts on SQLITE_BUSY/LOCKED, including connection initialization errors.
+        // Never turn a failed read into an empty approval list, and never retry decisions here.
+        for (var attempt = 0; ; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try { return await ReadApprovalsAsync(status, session, run, ct).ConfigureAwait(false); }
+            catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6 && attempt < 2)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(50 * (attempt + 1)), ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task<IResult> ReadApprovalsAsync(string? status, Guid? session, Guid? run, CancellationToken ct)
+    {
         await using var db = await _lifecycle.CreateDbContextAsync(ct);
         var q = db.ApprovalRequests.Where(x => x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId);
         if (!string.IsNullOrWhiteSpace(status)) q = q.Where(x => x.Status == status);
@@ -375,17 +720,108 @@ public sealed class ControlPlaneService
         if (string.IsNullOrWhiteSpace(status) || string.Equals(status, "pending", StringComparison.OrdinalIgnoreCase))
         {
             var permissions = await _authorization.ListPermissionRequestsAsync(null, run, null, ct).ConfigureAwait(false);
-            result.AddRange(permissions.Where(x => x.Status is PermissionRequestStatuses.AwaitingDelegate or PermissionRequestStatuses.AwaitingUser).Select(ToPermissionResponse));
+            var parks = permissions
+                .Where(x => x.Status is PermissionRequestStatuses.AwaitingDelegate or PermissionRequestStatuses.AwaitingUser)
+                .ToList();
+            var evidence = await LoadParkEvidenceAsync(db, parks.Select(x => x.Id).ToList(), ct);
+            result.AddRange(parks.Select(x => ToPermissionResponse(x, evidence.GetValueOrDefault(x.Id))));
         }
         return Results.Ok(result.OrderByDescending(x => x is ApprovalResponseDto approval ? approval.CreatedAt : DateTimeOffset.MinValue));
     }
+    public async Task<IResult> CreatePreAuthorization(PreAuthorizationRequestDto input, CancellationToken ct)
+    {
+        if (input.RunId == Guid.Empty) return Results.BadRequest(new { message = "run_id is required." });
+        var tools = (input.ToolScope ?? [])
+            .Where(t => !string.IsNullOrWhiteSpace(t)).Select(t => t.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (tools.Count == 0) return Results.BadRequest(new { message = "tool_scope must contain at least one tool id." });
+        if (tools.Any(t => string.Equals(t, "*", StringComparison.Ordinal)))
+            return Results.BadRequest(new { message = "Wildcard tool grants are not allowed in a pre-authorization." });
+        var riskMax = (input.RiskMax ?? "low").Trim().ToLowerInvariant() switch
+        {
+            "low" or "medium" or "high" or "elevated" or "critical" => (input.RiskMax ?? "low").Trim().ToLowerInvariant(),
+            _ => "low"
+        };
+        var now = DateTimeOffset.UtcNow;
+        var expiresAt = input.ExpiresAt ?? now.AddDays(7);
+        if (expiresAt <= now) return Results.BadRequest(new { message = "expires_at must be in the future." });
+        var maxUses = Math.Clamp(input.MaxUses <= 0 ? 1 : input.MaxUses, 1, 64);
+        await using var db = await _lifecycle.CreateDbContextAsync(ct);
+        var run = await db.Runs.AsNoTracking().SingleOrDefaultAsync(x => x.Id == input.RunId
+            && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId, ct);
+        if (run is null) return Results.NotFound(new { message = "Run was not found in this tenant/workspace." });
+        var row = new PreAuthorizationRecord
+        {
+            Id = Guid.NewGuid(),
+            TenantId = Tenant.TenantId,
+            WorkspaceId = Tenant.WorkspaceId,
+            RunId = input.RunId,
+            LaneKey = string.IsNullOrWhiteSpace(input.LaneKey) ? null : input.LaneKey!.Trim(),
+            ToolScopeJson = JsonSerializer.Serialize(tools),
+            ParameterConstraintHash = string.IsNullOrWhiteSpace(input.ParameterConstraintHash) ? null : input.ParameterConstraintHash!.Trim().ToLowerInvariant(),
+            RiskMax = riskMax,
+            MaxUses = maxUses,
+            UseCount = 0,
+            ExpiresAt = expiresAt,
+            GrantedByPrincipalId = Tenant.PrincipalId,
+            Summary = input.Summary,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+        db.PreAuthorizations.Add(row);
+        await db.SaveChangesAsync(ct);
+        // The user's pre-authorization is also a real delegable capability grant
+        // per tool: the deterministic PDP must find a grant to issue the lease
+        // that carries the call to the approval layer, where the pre-authorization
+        // row is consumed once. The grant is an admission envelope, not the
+        // consumption control — the row's max_uses budget is spent by the approval
+        // mint, one per tool call — so the grant's own budget only has to cover
+        // the lease-use reservation the dispatcher asks for (the task's remaining
+        // tool rounds) across every call the row may release. Risk ceilings are
+        // still re-checked by the approval layer before any tool runs.
+        if (run.InitiatedByPrincipalId is { } runPrincipal && runPrincipal != Guid.Empty)
+        {
+            foreach (var tool in tools)
+            {
+                await _authorization.GrantCapabilityAsync(new GrantCapabilityCommand(
+                    runPrincipal,
+                    SubjectAgentInstanceId: null,
+                    new CapabilityClaim("tool.invoke", "*", $"tool://{tool}"),
+                    input.RunId,
+                    TaskId: null,
+                    expiresAt,
+                    Math.Clamp(maxUses * 64, maxUses, 10_000),
+                    Transferable: false,
+                    ParentGrantId: null,
+                    Reason: $"Pre-authorization {row.Id}: {(string.IsNullOrWhiteSpace(input.Summary) ? "unattended tool release" : input.Summary.Trim())}"), ct).ConfigureAwait(false);
+            }
+        }
+        return Results.Json(new
+        {
+            id = row.Id,
+            run_id = row.RunId,
+            lane_key = row.LaneKey,
+            tool_scope = tools,
+            parameter_constraint_hash = row.ParameterConstraintHash,
+            risk_max = row.RiskMax,
+            max_uses = row.MaxUses,
+            use_count = 0,
+            expires_at = row.ExpiresAt,
+            revoked = false
+        }, statusCode: 201);
+    }
+
     public async Task<IResult> GetApproval(Guid id, CancellationToken ct)
     {
         await using var db = await _lifecycle.CreateDbContextAsync(ct);
         var row = await db.ApprovalRequests.SingleOrDefaultAsync(x => x.Id == id && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId, ct);
         if (row is not null) return Results.Ok(ToResponse(row));
         var permission = await _authorization.GetPermissionRequestAsync(id, ct).ConfigureAwait(false);
-        return permission is null ? Results.NotFound() : Results.Ok(ToPermissionResponse(permission.Request));
+        if (permission is null) return Results.NotFound();
+        if (permission.Request.Status is not (PermissionRequestStatuses.AwaitingDelegate or PermissionRequestStatuses.AwaitingUser))
+            return Results.Ok(ToPermissionResponse(permission.Request, evidence: null));
+        var parkEvidence = await LoadParkEvidenceAsync(db, [id], ct);
+        return Results.Ok(ToPermissionResponse(permission.Request, parkEvidence.GetValueOrDefault(id)));
     }
     public async Task<IResult> DecideApproval(Guid id, ApprovalDecisionRequestDto input, CancellationToken ct)
     {
@@ -413,20 +849,74 @@ public sealed class ControlPlaneService
                             : StatusCodes.Status200OK);
                 }
             }
+            // "Always allow for this session" is applied AFTER the decision is
+            // committed, so the scope can only ever cover a tool the human actually
+            // approved — never a broader one.
+            var runScope = approve && IsRunScope(input.Scope);
+            RunScopeOutcome? runScopeOutcome = null;
             if (resolved.Request.Status == PermissionRequestStatuses.Granted && resolved.Request.RunId is { } permissionRun)
             {
+                if (runScope)
+                    runScopeOutcome = await ApplyRunScopeAsync(resolved.Request, ct).ConfigureAwait(false);
+
+                Guid? executionId = null;
                 await using var db = await _lifecycle.CreateDbContextAsync(ct);
                 var execution = await db.ToolExecutions.SingleOrDefaultAsync(x => x.PermissionRequestId == id && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId, ct);
                 if (execution is not null)
                 {
+                    executionId = execution.Id;
                     var snapshot = await _executions.EnsureApprovalAsync(execution.Id, ct).ConfigureAwait(false);
                     if (snapshot.ApprovalId is { } actionApproval)
                         await _approvals.DecideAsync(actionApproval, approve ? "approved" : "rejected", input.Reason, ct).ConfigureAwait(false);
                 }
+                await _runs.AppendEventAsync(permissionRun, "governance.permission_decided", new
+                {
+                    permission_request_id = resolved.Request.Id,
+                    authorization_decision_id = resolved.Decision.Id,
+                    execution_id = executionId,
+                    outcome = resolved.Decision.Outcome,
+                    reason_code = resolved.Decision.ReasonCode
+                }, "Permission decision committed; run resumed.", cancellationToken: ct).ConfigureAwait(false);
                 await _runs.SetRunStatusAsync(permissionRun.ToString(), "executing", "Legacy approval decision committed; resuming run.", ct).ConfigureAwait(false);
                 await _engine.EnqueueAsync(permissionRun, ct).ConfigureAwait(false);
             }
-            return Results.Ok(new { id, status = resolved.Request.Status, decided_at = resolved.Decision.CreatedAt });
+            else if (resolved.Request.RunId is { } deniedRun
+                && resolved.Request.Status is not (PermissionRequestStatuses.AwaitingDelegate or PermissionRequestStatuses.AwaitingUser))
+            {
+                // A denied permission request must wake the parked run too: without
+                // the enqueue the awaiting_user run is never lease-eligible and
+                // hangs forever. Denial semantics are preserved — nothing is
+                // consumed and no grant is minted; the resumed dispatch observes
+                // the denied request and the engine drives the task/lane to its
+                // failure or escalation terminal state. This mirrors the wake-up
+                // GovernanceEndpoints applies to every terminal permission decision.
+                var deniedRunState = await _runs.GetRunStateAsync(deniedRun.ToString(), ct).ConfigureAwait(false);
+                if (deniedRunState.Status is not (RunStatus.Completed or RunStatus.Failed or RunStatus.Cancelled))
+                {
+                    if (deniedRunState.Status is RunStatus.AwaitingApproval or RunStatus.AwaitingDelegate or RunStatus.AwaitingUser)
+                    {
+                        await _runs.SetRunStatusAsync(deniedRun.ToString(), "executing", "Permission request denied; resuming run to fail closed.", ct).ConfigureAwait(false);
+                        await _runs.AppendEventAsync(deniedRun, "governance.permission_decided", new
+                        {
+                            permission_request_id = resolved.Request.Id,
+                            authorization_decision_id = resolved.Decision.Id,
+                            outcome = resolved.Decision.Outcome,
+                            reason_code = resolved.Decision.ReasonCode
+                        }, "Permission decision committed; run resumed.", cancellationToken: ct).ConfigureAwait(false);
+                    }
+                    await _engine.EnqueueAsync(deniedRun, ct).ConfigureAwait(false);
+                }
+            }
+            return Results.Ok(new
+            {
+                id,
+                status = resolved.Request.Status,
+                decided_at = resolved.Decision.CreatedAt,
+                scope = runScope ? "run" : "once",
+                run_scope_released = runScopeOutcome?.Released ?? 0,
+                pre_authorization_id = runScopeOutcome?.PreAuthorizationId,
+                capability_grant_id = runScopeOutcome?.GrantId
+            });
         }
         var approveAction = string.Equals(input.Decision, "approved", StringComparison.OrdinalIgnoreCase)
             || string.Equals(input.Decision, "approve", StringComparison.OrdinalIgnoreCase)
@@ -458,22 +948,193 @@ public sealed class ControlPlaneService
         return Results.Ok(new { id = decision.ApprovalId, status = decision.Status, decided_at = decision.DecidedAt });
     }
 
-    private static ApprovalResponseDto ToResponse(ApprovalRequestRecord row) => new()
-    { Id = row.Id, ProjectId = row.ProjectId, SessionId = row.SessionId, RunId = row.RunId, TaskId = row.TaskId, AgentInstanceId = row.AgentInstanceId, ExecutionId = row.ExecutionId, Kind = row.Kind, ToolId = row.ToolId, Risk = row.Risk, Summary = row.Summary, Status = row.Status, RequestHash = row.RequestHash, ConsumedByExecutionId = row.ConsumedByExecutionId, Decision = row.Decision, DecisionReason = row.DecisionReason, DecidedAt = row.DecidedAt, ConsumedAt = row.ConsumedAt, ExpiresAt = row.ExpiresAt, CreatedAt = row.CreatedAt, UpdatedAt = row.UpdatedAt };
+    private static bool IsRunScope(string? scope) =>
+        string.Equals(scope, "run", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(scope, "session", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(scope, "always", StringComparison.OrdinalIgnoreCase);
 
-    private static ApprovalResponseDto ToPermissionResponse(PermissionRequestSnapshot value) => new()
+    /// <summary>The risk the session allowance is capped at, fail-closed on an unknown value.</summary>
+    private static string RiskCeiling(string? risk) => risk?.Trim().ToLowerInvariant() switch
     {
-        Id = value.Id,
-        RunId = value.RunId,
-        TaskId = value.TaskId,
-        AgentInstanceId = value.SubjectAgentInstanceId,
-        Kind = "permission",
-        ToolId = value.Claim.Resource.StartsWith("tool://", StringComparison.OrdinalIgnoreCase) ? value.Claim.Resource[7..] : value.Claim.Resource,
-        Risk = value.Risk,
-        Summary = "Tool permission request requires authorization.",
-        Status = "pending",
-        ExpiresAt = value.ExpiresAt,
-        CreatedAt = value.CreatedAt,
-        UpdatedAt = value.UpdatedAt
+        "low" or "medium" or "high" or "elevated" or "critical" => risk!.Trim().ToLowerInvariant(),
+        _ => "low"
     };
+
+    /// <summary>How many calls a session approval covers before it must be renewed.</summary>
+    private const int RunScopeMaxUses = 512;
+
+    private sealed record RunScopeOutcome(Guid PreAuthorizationId, Guid GrantId, int Released);
+
+    /// <summary>
+    /// "Always allow for this session", applied as two durable envelopes because two
+    /// separate gates ask:
+    /// <list type="bullet">
+    /// <item>the run-scoped PRE-AUTHORIZATION is what stops the tool-approval layer
+    /// from asking again — it mints an approval for a matching call with no human,
+    /// and its risk ceiling is the class the human actually approved, so a session
+    /// approval never widens the risk it was given;</item>
+    /// <item>the run-scoped CAPABILITY GRANT is what stops the PDP from asking again —
+    /// without it the next call has no grant to lease and parks before the approval
+    /// layer is ever consulted.</item>
+    /// </list>
+    /// The scope is always exactly one tool. A wildcard, an empty tool id, or a
+    /// non-tool claim is never widened by a decision. Finally, pending sibling
+    /// requests for the same tool are released with it: a decision that only applied
+    /// to the future would leave an already-parked sibling waiting for the very click
+    /// the user just declined to make.
+    /// </summary>
+    private async Task<RunScopeOutcome?> ApplyRunScopeAsync(PermissionRequestSnapshot decided, CancellationToken ct)
+    {
+        var resource = decided.Claim.Resource;
+        if (!resource.StartsWith("tool://", StringComparison.OrdinalIgnoreCase)) return null;
+        var toolId = resource["tool://".Length..];
+        if (string.IsNullOrWhiteSpace(toolId) || toolId == "*") return null;
+        if (decided.RunId is not { } runId) return null;
+
+        var now = DateTimeOffset.UtcNow;
+        // The envelopes are run-scoped, so they cannot outlive the run's authority
+        // even if the window is generous; it only has to cover a long session.
+        var expiresAt = now.AddHours(8);
+        await using var db = await _lifecycle.CreateDbContextAsync(ct);
+        var run = await db.Runs.AsNoTracking().SingleOrDefaultAsync(x => x.Id == runId
+            && x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId, ct);
+        if (run?.InitiatedByPrincipalId is not { } principal || principal == Guid.Empty) return null;
+
+        var row = new PreAuthorizationRecord
+        {
+            Id = Guid.NewGuid(),
+            TenantId = Tenant.TenantId,
+            WorkspaceId = Tenant.WorkspaceId,
+            RunId = runId,
+            LaneKey = null,
+            ToolScopeJson = JsonSerializer.Serialize(new[] { toolId }),
+            ParameterConstraintHash = null,
+            RiskMax = RiskCeiling(decided.Risk),
+            MaxUses = RunScopeMaxUses,
+            UseCount = 0,
+            ExpiresAt = expiresAt,
+            GrantedByPrincipalId = Tenant.PrincipalId,
+            Summary = $"Run-scoped approval for '{toolId}'.",
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+        db.PreAuthorizations.Add(row);
+        await db.SaveChangesAsync(ct);
+
+        // SubjectAgentInstanceId stays null so the allowance covers every worker of
+        // this run, which is what "for this session" means to the user.
+        var grant = await _authorization.GrantCapabilityAsync(new GrantCapabilityCommand(
+            principal,
+            SubjectAgentInstanceId: null,
+            new CapabilityClaim("tool.invoke", "*", resource),
+            runId,
+            TaskId: null,
+            expiresAt,
+            Math.Clamp(RunScopeMaxUses * 8, RunScopeMaxUses, 10_000),
+            Transferable: false,
+            ParentGrantId: null,
+            Reason: $"Run-scoped approval for '{toolId}'."), ct).ConfigureAwait(false);
+
+        var released = 0;
+        var pending = await _authorization.ListPermissionRequestsAsync(null, runId, null, ct).ConfigureAwait(false);
+        foreach (var sibling in pending)
+        {
+            if (sibling.Id == decided.Id) continue;
+            if (sibling.Status is not (PermissionRequestStatuses.AwaitingUser or PermissionRequestStatuses.AwaitingDelegate)) continue;
+            if (!string.Equals(sibling.Claim.Resource, resource, StringComparison.OrdinalIgnoreCase)) continue;
+            try
+            {
+                await _authorization.DecidePermissionAsync(new PermissionDecisionCommand(
+                    sibling.Id, true, null, null, $"Released by a run-scoped approval for '{toolId}'."), ct).ConfigureAwait(false);
+                released++;
+            }
+            catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
+            {
+                // A sibling another actor decided first is not a failure of this
+                // decision: the user's intent is already satisfied either way.
+                Debug.WriteLine($"Sibling permission request {sibling.Id} was not released by the run scope: {ex.Message}");
+            }
+        }
+
+        await _runs.AppendEventAsync(runId, "approval.run_scope_granted", new
+        {
+            tool_id = toolId,
+            pre_authorization_id = row.Id,
+            capability_grant_id = grant.Id,
+            risk_max = row.RiskMax,
+            max_uses = row.MaxUses,
+            expires_at = expiresAt,
+            released_pending = released
+        }, $"Run-scoped approval granted for '{toolId}'.", "info", null, null, cancellationToken: ct).ConfigureAwait(false);
+
+        return new RunScopeOutcome(row.Id, grant.Id, released);
+    }
+
+    private static ApprovalResponseDto ToResponse(ApprovalRequestRecord row)
+    {
+        // Rows minted before the evidence digest landed decode to nothing and keep
+        // showing only their stored summary — the projection never invents facts.
+        var hasEvidence = ApprovalEvidenceProjector.TryDecode(row.ArgumentsDigest, out var evidence);
+        return new ApprovalResponseDto
+        {
+            Id = row.Id, ProjectId = row.ProjectId, SessionId = row.SessionId, RunId = row.RunId, TaskId = row.TaskId, AgentInstanceId = row.AgentInstanceId, ExecutionId = row.ExecutionId, Kind = row.Kind, ToolId = row.ToolId, Risk = row.Risk, Summary = row.Summary, Arguments = hasEvidence ? evidence.Arguments : string.Empty, Command = evidence.Command, Cwd = evidence.WorkingDirectory, ResourcePath = evidence.ResourcePath, Status = row.Status, RequestHash = row.RequestHash, ConsumedByExecutionId = row.ConsumedByExecutionId, Decision = row.Decision, DecisionReason = row.DecisionReason, DecidedAt = row.DecidedAt, ConsumedAt = row.ConsumedAt, ExpiresAt = row.ExpiresAt, CreatedAt = row.CreatedAt, UpdatedAt = row.UpdatedAt
+        };
+    }
+
+    /// <summary>
+    /// A policy park is decided by a human, but the parameters that motivated it are on
+    /// the tool execution row: ToolDispatcher binds execution.permission_request_id
+    /// before it returns, so the link already exists while the request is pending.
+    /// Without this join the reviewer sees a claim string and nothing else.
+    /// </summary>
+    private async Task<Dictionary<Guid, ApprovalEvidence>> LoadParkEvidenceAsync(
+        LifecycleDbContext db, List<Guid> permissionRequestIds, CancellationToken ct)
+    {
+        var evidence = new Dictionary<Guid, ApprovalEvidence>();
+        if (permissionRequestIds.Count == 0) return evidence;
+        var rows = await db.ToolExecutions.AsNoTracking().Where(x =>
+            x.TenantId == Tenant.TenantId && x.WorkspaceId == Tenant.WorkspaceId
+            && x.PermissionRequestId != null && permissionRequestIds.Contains(x.PermissionRequestId.Value))
+            .Select(x => new { PermissionRequestId = x.PermissionRequestId, x.ArgumentsDigest })
+            .ToListAsync(ct).ConfigureAwait(false);
+        foreach (var row in rows)
+        {
+            if (row.PermissionRequestId is { } permissionId
+                && ApprovalEvidenceProjector.TryDecode(row.ArgumentsDigest, out var projected))
+            {
+                evidence[permissionId] = projected;
+            }
+        }
+        return evidence;
+    }
+
+    private static ApprovalResponseDto ToPermissionResponse(
+        PermissionRequestSnapshot value,
+        ApprovalEvidence? evidence)
+    {
+        // A policy park used to report nothing but "requires authorization". When it
+        // came from a tool call the execution's frozen digest names the real target;
+        // otherwise the claim itself is the most specific fact available.
+        var resource = value.Claim.Resource;
+        return new ApprovalResponseDto
+        {
+            Id = value.Id,
+            RunId = value.RunId,
+            TaskId = value.TaskId,
+            AgentInstanceId = value.SubjectAgentInstanceId,
+            Kind = "permission",
+            ToolId = resource.StartsWith("tool://", StringComparison.OrdinalIgnoreCase) ? resource[7..] : resource,
+            Risk = value.Risk,
+            Summary = evidence?.Summary ?? "Tool permission request requires authorization.",
+            Arguments = evidence?.Arguments ?? JsonSerializer.Serialize(new { capability = value.Claim.Capability, action = value.Claim.Action, resource }),
+            Command = evidence?.Command,
+            Cwd = evidence?.WorkingDirectory,
+            ResourcePath = evidence?.ResourcePath
+                ?? (resource.StartsWith("path://", StringComparison.OrdinalIgnoreCase) ? resource[7..] : null),
+            Status = "pending",
+            ExpiresAt = value.ExpiresAt,
+            CreatedAt = value.CreatedAt,
+            UpdatedAt = value.UpdatedAt
+        };
+    }
 }

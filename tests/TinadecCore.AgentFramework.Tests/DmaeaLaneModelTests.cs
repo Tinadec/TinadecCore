@@ -1,0 +1,330 @@
+using System.Text;
+using TinadecCore.DmaEA;
+using TinadecCore.DmaEA.Orchestration;
+
+namespace TinadecCore.AgentFramework.Tests;
+
+/// <summary>
+/// M1 lane data model: per-lane task-key uniqueness, the lane fields on the
+/// durable task node, and the replan merge that must carry runtime lane state
+/// across a planner rewrite.
+/// </summary>
+public sealed class DmaeaLaneModelTests : IDisposable
+{
+    private readonly string _directory = Path.Combine(Path.GetTempPath(), "tinadec-lane-model-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_directory)) Directory.Delete(_directory, recursive: true);
+    }
+
+    [Fact]
+    public void ValidateAndMaterializeGraph_AllowsSameTaskKeyAcrossLanes()
+    {
+        var tasks = new[]
+        {
+            Task("test", "Test the build", lane: "l2"),
+            Task("test", "Test the build", lane: "main")
+        };
+
+        var nodes = FullDuplexRunEngine.ValidateAndMaterializeGraph(tasks, maxTasks: 8);
+
+        Assert.Equal(2, nodes.Count);
+        Assert.All(nodes, node => Assert.Equal("test", node.TaskKey));
+        Assert.Equal(["l2", "main"], nodes.Select(node => node.LaneKey).Order().ToArray());
+    }
+
+    [Fact]
+    public void ValidateAndMaterializeGraph_RejectsDuplicateKeyWithinLane()
+    {
+        var tasks = new[]
+        {
+            Task("test", "First test task", lane: "l2"),
+            Task("test", "Second test task", lane: "l2")
+        };
+
+        var failure = Assert.Throws<FullDuplexRunEngine.InvalidTaskGraphException>(
+            () => FullDuplexRunEngine.ValidateAndMaterializeGraph(tasks, maxTasks: 8));
+        Assert.Contains("not unique within lane 'l2'", failure.Message);
+    }
+
+    [Fact]
+    public void ValidateAndMaterializeGraph_DefaultsMissingLaneToMain()
+    {
+        var tasks = new[] { Task(null, "Build the thing") };
+
+        var nodes = FullDuplexRunEngine.ValidateAndMaterializeGraph(tasks, maxTasks: 8);
+
+        var node = Assert.Single(nodes);
+        Assert.Equal("main", node.LaneKey);
+    }
+
+    [Fact]
+    public void MergeReplannedGraph_PreservesLaneKeyWaitsAndCriteriaVerdicts()
+    {
+        var prior = new DurableTaskNode
+        {
+            TaskId = Guid.NewGuid(),
+            TaskKey = "test",
+            Title = "Test the build",
+            Status = "completed",
+            LaneKey = "l2",
+            Waits = [LaneWait.UntilLaneDone("main")],
+            CriteriaVerdicts =
+            [
+                new CriterionVerdict("全部测试通过", true, "run:pytest 42 passed"),
+                new CriterionVerdict("无回归", false, null)
+            ],
+            Evidence = ["pytest output"]
+        };
+        var replacement = new DurableTaskNode
+        {
+            TaskId = Guid.NewGuid(),
+            TaskKey = "test",
+            Title = "Test the build (renamed)",
+            Status = "pending"
+        };
+
+        var merged = FullDuplexRunEngine.MergeReplannedGraph([prior], [replacement]);
+
+        var node = Assert.Single(merged);
+        Assert.Equal("completed", node.Status);
+        Assert.Equal(prior.TaskId, node.TaskId);
+        Assert.Equal("l2", node.LaneKey);
+        var wait = Assert.Single(node.Waits);
+        Assert.Equal("main", wait.LaneKey);
+        Assert.Equal(LaneWait.LaneDone, wait.Predicate);
+        Assert.Equal(2, node.CriteriaVerdicts.Count);
+        Assert.Contains(node.CriteriaVerdicts, verdict => verdict.Satisfied);
+        Assert.Contains(node.CriteriaVerdicts, verdict => !verdict.Satisfied);
+    }
+
+    [Fact]
+    public void MergeReplannedGraph_KeepsReplacementFieldsForUnfinishedTasks()
+    {
+        var prior = new DurableTaskNode
+        {
+            TaskId = Guid.NewGuid(),
+            TaskKey = "implement",
+            Title = "Implement",
+            Status = "failed",
+            LaneKey = "l2",
+            Waits = [LaneWait.UntilLaneDone("main")]
+        };
+        var replacement = new DurableTaskNode
+        {
+            TaskId = Guid.NewGuid(),
+            TaskKey = "implement",
+            Title = "Implement",
+            Status = "pending",
+            LaneKey = "l9",
+            Waits = [LaneWait.UntilLaneDone("main"), LaneWait.UntilLaneDone("l2")]
+        };
+
+        var merged = FullDuplexRunEngine.MergeReplannedGraph([prior], [replacement]);
+
+        var node = Assert.Single(merged);
+        // Only completed tasks keep their prior runtime state; an unfinished task
+        // adopts the planner's new lane topology wholesale.
+        Assert.Equal("l9", node.LaneKey);
+        Assert.Equal(["main", "l2"], node.Waits.Select(wait => wait.LaneKey).ToArray());
+    }
+
+    [Fact]
+    public void Orchestration_ShippedBaselineParsesCeilings()
+    {
+        var baseline = LocateShippedBaseline();
+        Assert.True(File.Exists(baseline), $"Shipped baseline TOML was not found at {baseline}.");
+
+        var snapshot = AgentRuntimeConfigurationStore.LoadSnapshot(baseline, version: 1);
+
+        Assert.False(snapshot.Orchestration.LanesEnabled);
+        Assert.Equal(4, snapshot.Orchestration.MaxLanesPerRun);
+        Assert.Equal(6, snapshot.Orchestration.MaxTasksPerLane);
+    }
+
+    [Fact]
+    public void Orchestration_MissingSectionFallsBackToDisabled()
+    {
+        var snapshot = LoadSnapshot(BaselineToml());
+
+        Assert.Equal(OrchestrationPolicy.Disabled, snapshot.Orchestration);
+        Assert.False(snapshot.Orchestration.LanesEnabled);
+    }
+
+    [Fact]
+    public void Orchestration_TomlSectionOverridesDefaults()
+    {
+        var snapshot = LoadSnapshot([.. BaselineToml(), "", "[orchestration]", "lanes_enabled = true", "max_lanes_per_run = 3", "max_tasks_per_lane = 5"]);
+
+        Assert.True(snapshot.Orchestration.LanesEnabled);
+        Assert.Equal(3, snapshot.Orchestration.MaxLanesPerRun);
+        Assert.Equal(5, snapshot.Orchestration.MaxTasksPerLane);
+    }
+
+    [Fact]
+    public void Orchestration_RejectsInvalidCeilings()
+    {
+        Assert.Throws<InvalidDataException>(
+            () => LoadSnapshot([.. BaselineToml(), "", "[orchestration]", "lanes_enabled = true", "max_lanes_per_run = 0"]));
+        Assert.Throws<InvalidDataException>(
+            () => LoadSnapshot([.. BaselineToml(), "", "[orchestration]", "max_tasks_per_lane = -1"]));
+        Assert.Throws<InvalidDataException>(
+            () => OrchestrationPolicy.Validate(new OrchestrationPolicy(true, 17, 6)));
+    }
+
+    [Fact]
+    public void CrossLaneWaits_WaitsOnOtherLaneActiveDependency()
+    {
+        var tasks = new[]
+        {
+            Node("a", "main", "running"),
+            Node("b", "l2", "pending", ["a"])
+        };
+
+        Assert.Equal(["main"], FullDuplexRunEngine.CrossLaneWaitsFor(tasks, "l2"));
+    }
+
+    [Fact]
+    public void CrossLaneWaits_ReturnsNullForInLaneUnmetDependency()
+    {
+        var tasks = new[]
+        {
+            Node("a", "l2", "pending"),
+            Node("b", "l2", "pending", ["a"])
+        };
+
+        // A lane blocked only by its own chain is a stuck graph, not a wait.
+        Assert.Null(FullDuplexRunEngine.CrossLaneWaitsFor(tasks, "l2"));
+    }
+
+    [Fact]
+    public void CrossLaneWaits_ReturnsNullWhenLaneStillHasInflightWork()
+    {
+        var running = new[] { Node("a", "l2", "running"), Node("b", "l2", "pending", ["a"]) };
+        Assert.Null(FullDuplexRunEngine.CrossLaneWaitsFor(running, "l2"));
+
+        var parked = Node("c", "l3", "pending");
+        parked.PendingToolExecutionId = "exec-1";
+        var parkedTasks = new[] { parked, Node("d", "l3", "pending", ["c"]) };
+        Assert.Null(FullDuplexRunEngine.CrossLaneWaitsFor(parkedTasks, "l3"));
+    }
+
+    [Fact]
+    public void CrossLaneWaits_ReturnsNullWhenDependencyDangles()
+    {
+        var tasks = new[] { Node("b", "l2", "pending", ["ghost"]) };
+
+        Assert.Null(FullDuplexRunEngine.CrossLaneWaitsFor(tasks, "l2"));
+    }
+
+    private static DurableTaskNode Node(string taskKey, string lane, string status, string[]? dependencies = null) => new()
+    {
+        TaskId = Guid.NewGuid(),
+        TaskKey = taskKey,
+        Title = taskKey,
+        Status = status,
+        LaneKey = lane,
+        Dependencies = dependencies?.ToList() ?? []
+    };
+
+    private static PlannedTask Task(string? taskKey, string title, string? lane = null) => new()
+    {
+        TaskKey = taskKey,
+        Title = title,
+        LaneKey = lane,
+        SuccessCriteria = ["done"],
+        Dependencies = [],
+        RequiredCapabilities = [],
+        RequiredTools = [],
+        Priority = 1,
+        Risk = "low"
+    };
+
+    private static string[] BaselineToml() =>
+    [
+        "schema_version = 1",
+        "[spawn]",
+        "max_depth = 2",
+        "max_agents_per_run = 16",
+        "max_parallel_workers = 4",
+        "[scheduling]",
+        "max_active_runs_per_session = 2",
+        "worker_retry_limit = 2",
+        "preserve_partial_results = true",
+        "[supervision]",
+        "required_before_final = true",
+        "max_revision_rounds = 2",
+        "[context]",
+        "default_token_budget = 8192",
+        "recent_message_limit = 24",
+        "optimistic_revision = true",
+        "[memory]",
+        "candidate_only = true",
+        "retrieval_limit = 8",
+        "allowed_scopes = [\"workspace\"]",
+        "allowed_kinds = [\"fact\"]",
+        "[tools]",
+        "provider = \"tinadec-tools\"",
+        "mutation_requires_approval = true",
+        "serialize_workspace_writes = true",
+        "default_timeout_seconds = 120",
+        "max_tool_rounds = 4"
+    ];
+
+    /// <summary>
+    /// The worker that discovers a parked approval-expiry review owns a private
+    /// checkpoint snapshot, and the merge back onto the owner checkpoint lands only
+    /// that worker's task node. The run-level park must be copied by name, or the next
+    /// wake reads the run as un-parked and supervision finalizes it past the user
+    /// decision the escalation just asked for. Measured in CI as status=completed with
+    /// `supervision.user_review.requested` already in the journal.
+    /// </summary>
+    [Fact]
+    public void PropagateExpiryPark_CarriesTheRunLevelParkOutOfAWorkerSnapshot()
+    {
+        var owner = new FullDuplexCheckpointV1 { Phase = "executing" };
+        var worker = new FullDuplexCheckpointV1 { Phase = "awaiting_user", AwaitingApprovalExpiryReview = true };
+
+        FullDuplexRunEngine.PropagateExpiryPark(owner, worker);
+
+        Assert.True(owner.AwaitingApprovalExpiryReview);
+        Assert.Equal("awaiting_user", owner.Phase);
+    }
+
+    /// <summary>
+    /// An ordinary approval wait is not an expiry review: it must not park the run on a
+    /// user decision nobody asked for.
+    /// </summary>
+    [Fact]
+    public void PropagateExpiryPark_LeavesAnOrdinaryWaitAlone()
+    {
+        var owner = new FullDuplexCheckpointV1 { Phase = "executing" };
+        var worker = new FullDuplexCheckpointV1 { Phase = "awaiting_user" };
+
+        FullDuplexRunEngine.PropagateExpiryPark(owner, worker);
+
+        Assert.False(owner.AwaitingApprovalExpiryReview);
+        Assert.Equal("executing", owner.Phase);
+    }
+
+    private AgentRuntimeConfigurationSnapshot LoadSnapshot(IReadOnlyList<string> lines)
+    {
+        Directory.CreateDirectory(_directory);
+        var path = Path.Combine(_directory, "agent-runtime.toml");
+        File.WriteAllLines(path, lines, Encoding.UTF8);
+        return AgentRuntimeConfigurationStore.LoadSnapshot(path, version: 1);
+    }
+
+    private static string LocateShippedBaseline()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "DmaEA", "Configuration", "default-agent-runtime.toml")))
+        {
+            directory = directory.Parent;
+        }
+        return directory is null
+            ? Path.Combine(AppContext.BaseDirectory, "DmaEA", "Configuration", "default-agent-runtime.toml")
+            : Path.Combine(directory.FullName, "DmaEA", "Configuration", "default-agent-runtime.toml");
+    }
+}

@@ -31,6 +31,16 @@ public sealed class AgentPackManifestDto
 
     [JsonPropertyName("activation")]
     public AgentPackActivationDto? Activation { get; init; }
+
+    // Unknown-member capture (defense in depth): without this, System.Text.Json
+    // silently drops unknown manifest members, and because the digest is computed
+    // over the re-serialized DTO the dropped bytes would also escape the integrity
+    // check. Capturing them keeps both the reader tolerant and the digest honest.
+    // Packs that rely on members this Core does not understand must also declare a
+    // capability in compatibility.required_core_capabilities (the whitelist gate
+    // rejects them fail-closed on older Cores).
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? Extensions { get; init; }
 }
 
 public sealed class AgentPackMetadataDto
@@ -49,6 +59,14 @@ public sealed class AgentPackMetadataDto
 
     [JsonPropertyName("version")]
     public string? Version { get; init; }
+
+    // Optional human-readable pack description (v1 additive). Omitted when absent
+    // so re-serialization — and therefore the manifest digest — stays byte-identical
+    // for packs that predate this field. Present in the bundled seed pack, whose
+    // raw JSON must equal the DTO round-trip byte-for-byte (closure invariant).
+    [JsonPropertyName("description")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Description { get; init; }
 }
 
 public sealed class AgentPackCompatibilityDto
@@ -70,6 +88,46 @@ public sealed class AgentPackResourcesDto
 
     [JsonPropertyName("modes")]
     public IReadOnlyList<AgentPackModeResourceDto> Modes { get; init; } = [];
+
+    // Optional (always-v1 discipline): an absent tools list means the legacy
+    // behavior — agent tool_scope entries are plain id references resolved against
+    // the frozen TinadecTools manifest. Declared tools add the two supported tiers:
+    // "reference" (id + hash-pin) and "definition" (controlled import registry).
+    // Packs carrying this section must declare the graph_mode_packs core capability.
+    // Nullable + omitted-when-absent so re-serialization (and therefore the
+    // manifest digest) stays byte-identical for packs that predate this field.
+    [JsonPropertyName("tools")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<AgentPackToolResourceDto>? Tools { get; init; }
+}
+
+public sealed class AgentPackToolResourceDto
+{
+    [JsonPropertyName("tool_id")]
+    public string? ToolId { get; init; }
+
+    // "reference" | "definition"
+    [JsonPropertyName("kind")]
+    public string? Kind { get; init; }
+
+    // reference tier: sha256 of the pinned TinadecTools manifest entry; a drift
+    // between the pinned hash and the live entry fails the pack admission gate.
+    [JsonPropertyName("entry_hash")]
+    public string? EntryHash { get; init; }
+
+    // definition tier
+    [JsonPropertyName("display_name")]
+    public string? DisplayName { get; init; }
+
+    [JsonPropertyName("description")]
+    public string? Description { get; init; }
+
+    // definition manifest: names/refs/schema only — inline secret values are
+    // rejected by the publish gate, never stored. Nullable: reference-tier tools
+    // omit it, and a default JsonElement cannot be re-serialized for the digest.
+    [JsonPropertyName("definition")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? Definition { get; init; }
 }
 
 public sealed class AgentPackAgentResourceDto
@@ -149,8 +207,71 @@ public sealed class AgentPackModeResourceDto
     [JsonPropertyName("edges")]
     public IReadOnlyList<AgentPackModeEdgeDto> Edges { get; init; } = [];
 
+    // Optional per-node mode bindings (see resources.tools note: omitted when
+    // absent so legacy digests stay byte-identical).
+    [JsonPropertyName("bindings")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<AgentPackModeBindingDto>? Bindings { get; init; }
+
+    /// <summary>
+    /// Mode-level prompt pipeline (typed reference, e.g. <c>prompt:solo-base</c>).
+    ///
+    /// A prompt pipeline is otherwise bound per AGENT, which is why several modes used
+    /// to share one set of instructions: nothing on the mode could say "this mode
+    /// collaborates differently". When declared, this pipeline wins over every agent's
+    /// own <c>base_prompt_pipeline_ref</c> for the whole mode — a mode's pipeline
+    /// describes the COLLABORATION SEMANTICS and therefore reaches the conversation
+    /// identity and every execution-layer worker alike.
+    ///
+    /// Nullable + omitted-when-absent, following the same rule as <see cref="Bindings"/>:
+    /// writing an explicit null would change the digest of packs that predate the field.
+    /// Per-agent role wording inside one mode stays on the agent's own
+    /// <c>system_prompt</c>, which is mode-independent by design.
+    /// </summary>
+    [JsonPropertyName("prompt_pipeline_ref")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PromptPipelineRef { get; init; }
+
     [JsonPropertyName("canvas_layout")]
     public JsonElement CanvasLayout { get; init; }
+}
+
+public sealed class AgentPackModeBindingDto
+{
+    // Omitted when absent: a node-less binding attaches an envelope to a spawnable
+    // template (free_form directors), and writing an explicit null would change the
+    // digest of manifests that simply leave the key out.
+    [JsonPropertyName("node_key")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NodeKey { get; init; }
+
+    [JsonPropertyName("agent_ref")]
+    public string? AgentRef { get; init; }
+
+    [JsonPropertyName("duty_description_ref")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DutyDescriptionRef { get; init; }
+
+    // json: { "<tool_id>": true|false } — can only narrow the template's tool scope
+    [JsonPropertyName("tool_switches")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? ToolSwitches { get; init; }
+
+    // json: { "spawn": {"max_depth":..,"max_agents_per_run":..,"max_parallel_workers":..},
+    //         "capabilities": [...], "tools": [...] } — envelope, narrowing only
+    [JsonPropertyName("envelope")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? Envelope { get; init; }
+
+    // R2: this mode legitimately relies on Core-reserved capabilities (e.g. the
+    // synthetic create_workspace ceiling that is deliberately not intersected with
+    // tool_scope); the publish gate skips envelope containment for them.
+    [JsonPropertyName("includes_core_reserved")]
+    public bool IncludesCoreReserved { get; init; }
+
+    [JsonPropertyName("instance_naming")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? InstanceNaming { get; init; }
 }
 
 public sealed class AgentPackModeNodeDto
@@ -169,6 +290,16 @@ public sealed class AgentPackModeNodeDto
 
     [JsonPropertyName("config")]
     public JsonElement Config { get; init; }
+
+    // Optional relationship description file (per-node duty contract). Five fields:
+    // duty / inputs_outputs / allowed_dispatch_targets / success_criteria /
+    // agent_types. Capped at 16KB serialized; compiled into the role system prompt
+    // through a fixed tail slot that participates in the prompt hash. Nullable +
+    // omitted-when-absent: a default JsonElement cannot be re-serialized, and an
+    // always-written empty element would change legacy manifest digests.
+    [JsonPropertyName("relationship")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? Relationship { get; init; }
 
     [JsonPropertyName("position")]
     public JsonElement Position { get; init; }

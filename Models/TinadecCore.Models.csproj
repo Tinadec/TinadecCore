@@ -15,7 +15,19 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.AI" />
     <PackageReference Include="Microsoft.Extensions.AI.OpenAI" />
+    <PackageReference Include="Anthropic.SDK" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" />
+  </ItemGroup>
+
+  <!--
+    The harness transports (stdio ACP, opencode serve, binary resolution, terminal hosting) moved here
+    from DmaEA, and their tests reach internals the same way they always did. DmaEA no longer sees any
+    of these types: it consumes IAgentChatClientFactory from Abstractions, which is the point of the move.
+  -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="TinadecCore.Api.Tests" />
+    <InternalsVisibleTo Include="TinadecCore.AgentFramework.Tests" />
+    <InternalsVisibleTo Include="TinadecCore.AspNetCore" />
   </ItemGroup>
 
 </Project>

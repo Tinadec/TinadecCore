@@ -99,6 +99,104 @@ public static class AgentPackEndpoints
                     [StatusCodes.Status422UnprocessableEntity] = "agent_pack_incompatible, invalid_agent_pack_manifest"
                 });
 
+        app.MapDelete("/api/v1/agent-packs/{packId}", async (
+            string packId,
+            HttpRequest httpRequest,
+            IAgentPackService service,
+            CancellationToken cancellationToken) =>
+        {
+            // Destructive and irreversible: the caller must name the revision it
+            // is purging, so a stale client cannot delete a pack that changed
+            // underneath it.
+            if (string.IsNullOrWhiteSpace(httpRequest.Headers.IfMatch.FirstOrDefault()))
+                throw new AgentPackDomainException(428, "if_match_required", "If-Match is required", "Deleting an agent pack requires the current installation revision in If-Match.");
+            var expectedRevision = ParseIfMatch(httpRequest.Headers.IfMatch.FirstOrDefault());
+            var result = await service.PurgeAsync(packId, expectedRevision, cancellationToken).ConfigureAwait(false);
+            return Results.Ok(result);
+        }).WithTags("AgentPacks")
+            .WithSummary("Permanently delete an installed agent pack and the runs it produced")
+            .Produces<AgentPackPurgeView>(StatusCodes.Status200OK)
+            .Produces<ProblemDetails>(StatusCodes.Status403Forbidden, "application/problem+json")
+            .Produces<ProblemDetails>(StatusCodes.Status404NotFound, "application/problem+json")
+            .Produces<ProblemDetails>(StatusCodes.Status412PreconditionFailed, "application/problem+json")
+            .Produces<ProblemDetails>(StatusCodes.Status428PreconditionRequired, "application/problem+json")
+            .WithAgentPackOpenApi(
+                problemCodes: new Dictionary<int, string>
+                {
+                    [StatusCodes.Status403Forbidden] = "agent_pack_management_forbidden",
+                    [StatusCodes.Status404NotFound] = "agent_pack_not_found",
+                    [StatusCodes.Status412PreconditionFailed] = "agent_pack_revision_conflict",
+                    [StatusCodes.Status428PreconditionRequired] = "if_match_required"
+                });
+
+        app.MapPost("/api/v1/agent-packs/{packId}/enable", async (
+            string packId,
+            IAgentPackService service,
+            HttpResponse response,
+            CancellationToken cancellationToken) =>
+        {
+            var result = await service.SetEnabledAsync(packId, enabled: true, cancellationToken).ConfigureAwait(false);
+            response.Headers.ETag = $"\"{result.Revision}\"";
+            return Results.Ok(result);
+        }).WithTags("AgentPacks")
+            .WithSummary("Enable an installed agent pack")
+            .Produces<AgentPackInstallationView>(StatusCodes.Status200OK)
+            .Produces<ProblemDetails>(StatusCodes.Status403Forbidden, "application/problem+json")
+            .Produces<ProblemDetails>(StatusCodes.Status404NotFound, "application/problem+json")
+            .WithAgentPackOpenApi(
+                etagStatuses: [StatusCodes.Status200OK],
+                problemCodes: new Dictionary<int, string>
+                {
+                    [StatusCodes.Status403Forbidden] = "agent_pack_management_forbidden",
+                    [StatusCodes.Status404NotFound] = "agent_pack_not_found"
+                });
+
+        app.MapPost("/api/v1/agent-packs/{packId}/disable", async (
+            string packId,
+            IAgentPackService service,
+            HttpResponse response,
+            CancellationToken cancellationToken) =>
+        {
+            var result = await service.SetEnabledAsync(packId, enabled: false, cancellationToken).ConfigureAwait(false);
+            response.Headers.ETag = $"\"{result.Revision}\"";
+            return Results.Ok(result);
+        }).WithTags("AgentPacks")
+            .WithSummary("Disable an installed agent pack without deleting it")
+            .Produces<AgentPackInstallationView>(StatusCodes.Status200OK)
+            .Produces<ProblemDetails>(StatusCodes.Status403Forbidden, "application/problem+json")
+            .Produces<ProblemDetails>(StatusCodes.Status404NotFound, "application/problem+json")
+            .WithAgentPackOpenApi(
+                etagStatuses: [StatusCodes.Status200OK],
+                problemCodes: new Dictionary<int, string>
+                {
+                    [StatusCodes.Status403Forbidden] = "agent_pack_management_forbidden",
+                    [StatusCodes.Status404NotFound] = "agent_pack_not_found"
+                });
+
+        app.MapPost("/api/v1/agent-packs/{packId}/adopt-defaults", async (
+            string packId,
+            IAgentPackService service,
+            HttpResponse response,
+            CancellationToken cancellationToken) =>
+        {
+            var result = await service.AdoptDefaultsAsync(packId, cancellationToken).ConfigureAwait(false);
+            response.Headers.ETag = $"\"{result.Revision}\"";
+            return Results.Ok(result);
+        }).WithTags("AgentPacks")
+            .WithSummary("Make this pack's activation resources the workspace defaults")
+            .Produces<AgentPackInstallationView>(StatusCodes.Status200OK)
+            .Produces<ProblemDetails>(StatusCodes.Status403Forbidden, "application/problem+json")
+            .Produces<ProblemDetails>(StatusCodes.Status404NotFound, "application/problem+json")
+            .Produces<ProblemDetails>(StatusCodes.Status409Conflict, "application/problem+json")
+            .WithAgentPackOpenApi(
+                etagStatuses: [StatusCodes.Status200OK],
+                problemCodes: new Dictionary<int, string>
+                {
+                    [StatusCodes.Status403Forbidden] = "agent_pack_management_forbidden",
+                    [StatusCodes.Status404NotFound] = "agent_pack_not_found",
+                    [StatusCodes.Status409Conflict] = "agent_pack_not_active"
+                });
+
         return app;
     }
 

@@ -20,7 +20,10 @@ public interface IAgentInstanceService
     Task ReleaseRunInstancesAsync(Guid runId, CancellationToken cancellationToken = default);
     Task<AgentCandidateRecord> CreateCandidateAsync(AgentCandidateProposal proposal, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<AgentCandidateRecord>> ListCandidatesAsync(string? status = null, CancellationToken cancellationToken = default);
-    Task<AgentCandidateRecord> DecideCandidateAsync(Guid candidateId, string decision, string? reason, CancellationToken cancellationToken = default);
+    Task<AgentCandidateRecord> DecideCandidateAsync(Guid candidateId, string decision, string? reason, CancellationToken cancellationToken = default, Guid? promotedAgentId = null);
+
+    /// <summary>Loads a candidate together with its immutable proposal body for promotion review.</summary>
+    Task<(AgentCandidateRecord Candidate, System.Text.Json.JsonElement Proposal)> GetCandidateWithProposalAsync(Guid candidateId, CancellationToken cancellationToken = default);
 }
 
 public sealed record RuntimeAgentSeed(
@@ -38,7 +41,21 @@ public sealed record RuntimeAgentSeed(
     Guid? TaskId = null,
     Guid? AgentDefinitionId = null,
     Guid? AgentVersionId = null,
-    string VersionContentHash = "");
+    string VersionContentHash = "",
+    string? LaneKey = null,
+    // DirectUserOutput is true only for the conversation-identity instance, which
+    // the engine derives from the frozen graph's conversation template slug — the
+    // seed never infers identity from a slug literal.
+    bool DirectUserOutput = false,
+    // Lineage for the engine-authored root path. The engine creates workers here rather
+    // than through SpawnAsync, so the derived depth has to travel on the seed: without it
+    // every engine-created worker would look like a root and SpawnPolicy.MaxDepth could
+    // not bound a dispatch chain. Both values are supplied by the caller that knows who
+    // dispatched the task; a genuine root (conversation author, supervisor, curator, lane
+    // planner) simply omits them and keeps depth 0.
+    Guid? ParentInstanceId = null,
+    int GenerationDepth = 0,
+    IReadOnlyList<string>? AllowedDispatchTargets = null);
 
 public enum AgentCreationIntent
 {
@@ -77,7 +94,10 @@ public sealed record FrozenAgentTemplate(
     IReadOnlyList<string> AllowedTools,
     Guid AgentDefinitionId,
     Guid AgentVersionId,
-    string VersionContentHash);
+    string VersionContentHash)
+{
+    public IReadOnlyList<string>? AllowedDispatchTargets { get; init; }
+}
 
 /// <summary>
 /// Run-frozen limits for generated agents. The durable engine supplies these values
@@ -99,20 +119,10 @@ public sealed record AgentCandidateProposal(
     Guid? ProjectId = null);
 
 /// <summary>
-/// A generated agent candidate is only a proposal.  Publishing a profile requires
-/// the separate sanitization, evaluation, review, publish, canary, and activation
-/// pipeline; there is intentionally no one-step promotion operation.
+/// A generated agent candidate is only a proposal. Promotion is review-driven:
+/// the endpoint layer sanitizes the immutable proposal, publishes an immutable
+/// AgentVersion through the AgentConfiguration boundary, and records the decision.
 /// </summary>
-public sealed class AgentCandidatePipelineRequiredException : InvalidOperationException
-{
-    public AgentCandidatePipelineRequiredException(Guid candidateId)
-        : base("Candidate promotion is disabled until the evolution pipeline completes.")
-    {
-        CandidateId = candidateId;
-    }
-
-    public Guid CandidateId { get; }
-}
 
 /// <summary>Wire-compatible spawn intent that is deliberately fail-closed.</summary>
 public sealed class AgentPromotionDisabledException : InvalidOperationException
@@ -170,16 +180,21 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         var now = DateTimeOffset.UtcNow;
         var definition = new AgentInstanceDefinition(
             seed.Id, seed.Layer, seed.Role, seed.ModelRoutePurpose, Normalize(seed.Capabilities), Normalize(seed.AllowedTools),
-            Normalize(seed.AllowedResources), Math.Max(0, seed.BudgetTokens), DirectUserOutput: seed.Id == "meeting", FormalMemoryWrite: false,
-            Goal: null, SuccessCriteria: [], ContextSelectors: []);
+            Normalize(seed.AllowedResources), Math.Max(0, seed.BudgetTokens), DirectUserOutput: seed.DirectUserOutput, FormalMemoryWrite: false,
+            Goal: null, SuccessCriteria: [], ContextSelectors: [])
+        {
+            AllowedDispatchTargets = NormalizeOptional(seed.AllowedDispatchTargets)
+        };
         var stored = await PutDefinitionAsync(scope.TenantId, scope.WorkspaceId, definition, cancellationToken).ConfigureAwait(false);
         var binding = ResolveBinding(definition.Id, seed.AgentDefinitionId, seed.AgentVersionId, seed.VersionContentHash, stored.Sha256);
         var row = new AgentInstanceRecord
         {
             Id = Guid.NewGuid(), TenantId = scope.TenantId, WorkspaceId = scope.WorkspaceId, SessionId = seed.SessionId, RunId = seed.RunId,
-            TaskNodeId = seed.TaskId, ProfileId = seed.ProfileId, Layer = seed.Layer, Role = seed.Role, GenerationDepth = 0,
+            TaskNodeId = seed.TaskId, ProfileId = seed.ProfileId, Layer = seed.Layer, Role = seed.Role,
+            ParentInstanceId = seed.ParentInstanceId, GenerationDepth = seed.GenerationDepth,
             AgentDefinitionId = binding.DefinitionId, AgentVersionId = binding.VersionId, AgentVersionHash = binding.ContentHash,
             Generated = false, Status = "running", DefinitionReference = stored.Value, DefinitionHash = stored.Sha256, DefinitionLength = stored.Length,
+            LaneKey = seed.LaneKey,
             CreatedAt = now, UpdatedAt = now
         };
         await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
@@ -229,6 +244,12 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
             throw new InvalidOperationException("Agent spawn budget for this run has been reached.");
         var tools = Normalize(request.AllowedTools);
         var resources = Normalize(request.AllowedResources);
+        // A wildcard is legal only in a published declaration, where it means "this role's
+        // delegable envelope".  A derived instance must always carry a concrete grant,
+        // otherwise a planner that names "*" would mint an all-tool worker and the
+        // per-instance authorization gate would stop being a real boundary.
+        if (tools.Any(value => string.Equals(value, "*", StringComparison.Ordinal)))
+            throw new UnauthorizedAccessException("Derived agents cannot carry a wildcard tool grant.");
         if (!IsSubset(tools, parentDefinition.AllowedTools) || !IsSubset(resources, parentDefinition.AllowedResources))
             throw new UnauthorizedAccessException("Child agent permissions cannot exceed its parent instance.");
         if (request.Template is { } requestedTemplate)
@@ -255,7 +276,10 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
                 new { goal = request.Goal.Trim(), successCriteria = Normalize(request.SuccessCriteria), contextSelectors = Normalize(request.ContextSelectors), allowedTools = tools, allowedResources = resources, intent = intent.ToString().ToLowerInvariant() }), cancellationToken).ConfigureAwait(false);
             var tempDefinition = new AgentInstanceDefinition(
                 candidate.Name, candidate.Layer, candidate.AgentType, parentDefinition.ModelRoutePurpose, [], tools, resources, Math.Clamp(request.BudgetTokens, 0, parentDefinition.BudgetTokens),
-                DirectUserOutput: false, FormalMemoryWrite: false, request.Goal.Trim(), Normalize(request.SuccessCriteria), Normalize(request.ContextSelectors));
+                DirectUserOutput: false, FormalMemoryWrite: false, request.Goal.Trim(), Normalize(request.SuccessCriteria), Normalize(request.ContextSelectors))
+            {
+                AllowedDispatchTargets = parentDefinition.AllowedDispatchTargets
+            };
             var tempStored = await PutDefinitionAsync(scope.TenantId, scope.WorkspaceId, tempDefinition, cancellationToken).ConfigureAwait(false);
             // A generated/candidate instance executes under its parent's frozen
             // published version until a candidate passes the separate publish
@@ -280,7 +304,10 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         var definition = new AgentInstanceDefinition(
             template?.Id ?? "generated.worker", "execution", template?.Role ?? (string.IsNullOrWhiteSpace(request.Role) ? "worker" : request.Role.Trim()),
             parentDefinition.ModelRoutePurpose, template?.Capabilities ?? [], tools, resources, Math.Clamp(request.BudgetTokens, 0, parentDefinition.BudgetTokens),
-            DirectUserOutput: false, FormalMemoryWrite: false, request.Goal.Trim(), Normalize(request.SuccessCriteria), Normalize(request.ContextSelectors));
+            DirectUserOutput: false, FormalMemoryWrite: false, request.Goal.Trim(), Normalize(request.SuccessCriteria), Normalize(request.ContextSelectors))
+        {
+            AllowedDispatchTargets = template?.AllowedDispatchTargets ?? parentDefinition.AllowedDispatchTargets
+        };
         var stored = await PutDefinitionAsync(scope.TenantId, scope.WorkspaceId, definition, cancellationToken).ConfigureAwait(false);
         var binding = template is null
             ? ResolveBinding(definition.Id, parent.AgentDefinitionId, parent.AgentVersionId, parent.AgentVersionHash, stored.Sha256)
@@ -367,7 +394,7 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         if (row is null || row.Status is not ("created" or "running")) return null;
         var definition = await ReadDefinitionAsync(row, cancellationToken).ConfigureAwait(false);
         return new AgentToolAuthorization(scope.TenantId, scope.WorkspaceId, row.SessionId, row.RunId,
-            taskId, row.Id, definition.AllowedTools, definition.AllowedResources);
+            taskId, row.Id, definition.AllowedTools, definition.AllowedResources, definition.AllowedDispatchTargets);
     }
 
     public async Task ReleaseRunInstancesAsync(Guid runId, CancellationToken cancellationToken = default)
@@ -405,9 +432,10 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         var scope = _tenant.Current;
         await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var query = db.Candidates.AsNoTracking().Where(item => item.TenantId == scope.TenantId && item.WorkspaceId == scope.WorkspaceId);
-        if (!string.IsNullOrWhiteSpace(status))
+        var normalized = ReviewVocabulary.Normalize(status, ReviewVocabulary.CandidateStatuses, "status");
+        if (normalized is not null)
         {
-            query = query.Where(item => item.Status == status.Trim().ToLowerInvariant());
+            query = query.Where(item => item.Status == normalized);
         }
 
         var rows = await query.ToListAsync(cancellationToken).ConfigureAwait(false);
@@ -415,21 +443,37 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         return rows;
     }
 
-    public async Task<AgentCandidateRecord> DecideCandidateAsync(Guid candidateId, string decision, string? reason, CancellationToken cancellationToken = default)
+    public async Task<AgentCandidateRecord> DecideCandidateAsync(Guid candidateId, string decision, string? reason, CancellationToken cancellationToken = default, Guid? promotedAgentId = null)
     {
-        if (string.Equals(decision, "promoted", StringComparison.OrdinalIgnoreCase))
-            throw new AgentCandidatePipelineRequiredException(candidateId);
-        if (!string.Equals(decision, "rejected", StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException("Candidate decision must be rejected until the evolution pipeline is implemented.", nameof(decision));
-        decision = decision.Trim().ToLowerInvariant();
+        var normalized = decision?.Trim().ToLowerInvariant();
+        if (normalized is not ("promoted" or "rejected"))
+            throw new ArgumentException("Candidate decision must be promoted or rejected.", nameof(decision));
+        if (normalized == "promoted" && promotedAgentId is null)
+            throw new ArgumentException("Promoting a candidate requires the published agent definition id.", nameof(promotedAgentId));
         var scope = _tenant.Current;
         await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var candidate = await db.Candidates.SingleOrDefaultAsync(x => x.Id == candidateId && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId, cancellationToken).ConfigureAwait(false)
             ?? throw new KeyNotFoundException("Agent candidate was not found.");
         if (candidate.Status != "proposed") throw new InvalidOperationException("Candidate has already been decided.");
-        candidate.Status = decision; candidate.DecisionReason = reason; candidate.DecidedByPrincipalId = scope.PrincipalId; candidate.UpdatedAt = DateTimeOffset.UtcNow;
+        candidate.Status = normalized;
+        candidate.DecisionReason = reason;
+        candidate.DecidedByPrincipalId = scope.PrincipalId;
+        if (normalized == "promoted") candidate.PromotedAgentId = promotedAgentId;
+        candidate.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return candidate;
+    }
+
+    public async Task<(AgentCandidateRecord Candidate, JsonElement Proposal)> GetCandidateWithProposalAsync(Guid candidateId, CancellationToken cancellationToken = default)
+    {
+        var scope = _tenant.Current;
+        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var candidate = await db.Candidates.AsNoTracking().SingleOrDefaultAsync(x => x.Id == candidateId && x.TenantId == scope.TenantId && x.WorkspaceId == scope.WorkspaceId, cancellationToken).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException("Agent candidate was not found.");
+        await using var stream = await _content.OpenReadAsync(
+            new ContentReference(candidate.ProposalReference, candidate.ProposalHash, candidate.ProposalLength, "application/json"), cancellationToken).ConfigureAwait(false);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+        return (candidate, document.RootElement.Clone());
     }
 
     private async Task<AgentInstanceRecord> FindInstanceAsync(Guid id, TenantContext scope, CancellationToken cancellationToken)
@@ -497,6 +541,11 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         caps.Any(c => string.Equals(c, required, StringComparison.OrdinalIgnoreCase) || string.Equals(c, "agent.spawn", StringComparison.OrdinalIgnoreCase) && required == "agent.create_temporary");
     private static string[] Normalize(IEnumerable<string> values) => values.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
+    /// <summary>
+    /// Ceiling test.  Callers guarantee the child set is concrete (no wildcard), so the
+    /// wildcard short-circuit here only expresses "this envelope delegates every tool";
+    /// it can no longer be used by a derived instance to widen its own grant.
+    /// </summary>
     private static bool IsSubset(IEnumerable<string> child, IEnumerable<string> parent)
     {
         var parentSet = parent.ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -558,5 +607,11 @@ internal sealed class AgentInstanceService : IAgentInstanceService, IAgentToolAu
         bool FormalMemoryWrite,
         string? Goal,
         IReadOnlyList<string> SuccessCriteria,
-        IReadOnlyList<string> ContextSelectors);
+        IReadOnlyList<string> ContextSelectors)
+    {
+        public IReadOnlyList<string>? AllowedDispatchTargets { get; init; }
+    }
+
+    private static IReadOnlyList<string>? NormalizeOptional(IReadOnlyList<string>? values) =>
+        values is null ? null : Normalize(values);
 }
