@@ -100,7 +100,6 @@ dotnet pack AspNetCore/TinadecCore.AspNetCore.csproj -c Release --no-restore
 TinadecCore 站在别人的工作上，我们明说：
 
 - **[Microsoft Agent Framework](https://github.com/microsoft/agent-framework)** —— 我们的规范编排基线（MAF 1.18），被收在严格的内部适配器后面，让 Core 的契约对 provider 保持中立。MAF 的工程质量让这一切成为可能；这份 README 的骨架与克制，也明显借自 MAF。
-- **开源智能体社区** —— 我们的参考决策（采纳了什么、拒绝了什么、为什么，附源码级证据）记录在 [tinadec-core-reference-decisions](https://github.com/Tinadec/TinadecOffice/blob/main/docs/tinadec-core-reference-decisions.zh-CN.md)。包括但不限于：源自 Codex 系 CLI 运行时的会话/工作区解耦思想，以及源自 JetBrains 平台的工具/VFS 思路。
 - **每一位发 PR 的人** —— 包括那些我们最后没合的。一个被拒的 PR，也是你花在了让它更好的时间。
 
 ## 社区

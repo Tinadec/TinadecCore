@@ -100,7 +100,6 @@ This is the important part, and it is the point of the whole thing:
 TinadecCore stands on other people's work, and we say so plainly:
 
 - **[Microsoft Agent Framework](https://github.com/microsoft/agent-framework)** — our normative orchestration baseline (MAF 1.18), used behind a strict internal adapter so that Core's contracts stay provider-neutral. The engineering quality of MAF made this possible; the discipline of its README is visibly borrowed here.
-- **The open-source agent community** — our reference decisions (what we adopted, what we rejected, and why, with source-level evidence) are recorded in [tinadec-core-reference-decisions](https://github.com/Tinadec/TinadecOffice/blob/main/docs/tinadec-core-reference-decisions.zh-CN.md). Among others: the session/workspace decoupling ideas traced from Codex-style CLI runtimes, and tool/VFS thinking traced from JetBrains platforms.
 - **Everyone who sends a PR** — including the ones we end up not merging. A rejected PR is still time you spent making this better.
 
 ## Community
